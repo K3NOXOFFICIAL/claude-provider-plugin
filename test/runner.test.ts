@@ -15,6 +15,7 @@ import {
   clearAccountState,
   hasLogin,
   splitModelEnv,
+  SESSION_ENTRIES,
 } from "../src/runner.js";
 import { PROXY_ADDON_PY } from "../src/proxy-addon.js";
 
@@ -101,6 +102,48 @@ describe("prepareAccountDir", () => {
       oauthAccount: { emailAddress: "b@x" },
       mcpServers: {},
     });
+  });
+});
+
+describe("shared sessions", () => {
+  const sessionFile = "projects/C--p1/s1.jsonl";
+
+  it("lets every account dir see sessions written by another", () => {
+    writeProfile("acc-a", { env: {} });
+    writeProfile("acc-b", { env: {} });
+    const a = prepareAccountDir("acc-a");
+    const b = prepareAccountDir("acc-b");
+    fs.mkdirSync(path.join(a, "projects", "C--p1"), { recursive: true });
+    fs.writeFileSync(path.join(a, sessionFile), "{}\n");
+    expect(fs.readFileSync(path.join(b, sessionFile), "utf8")).toBe("{}\n");
+    expect(fs.existsSync(path.join(home, ".claude", sessionFile))).toBe(true);
+    for (const entry of SESSION_ENTRIES) expect(fs.lstatSync(path.join(b, entry)).isSymbolicLink()).toBe(true);
+  });
+
+  it("merges a pre-existing private dir into the shared one without overwriting", () => {
+    writeProfile("acc-b", { env: {} });
+    const shared = path.join(home, ".claude", "file-history");
+    fs.mkdirSync(path.join(shared, "s1"), { recursive: true });
+    fs.writeFileSync(path.join(shared, "s1", "v1"), "shared");
+    const own = path.join(getAccountDir("acc-b"), "file-history");
+    fs.mkdirSync(path.join(own, "s1"), { recursive: true });
+    fs.mkdirSync(path.join(own, "s2"), { recursive: true });
+    fs.writeFileSync(path.join(own, "s1", "v1"), "private");
+    fs.writeFileSync(path.join(own, "s1", "v2"), "private");
+    fs.writeFileSync(path.join(own, "s2", "v1"), "b");
+
+    prepareAccountDir("acc-b");
+    expect(fs.lstatSync(own).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(path.join(shared, "s1", "v1"), "utf8")).toBe("shared");
+    expect(fs.readFileSync(path.join(shared, "s1", "v2"), "utf8")).toBe("private");
+    expect(fs.readFileSync(path.join(shared, "s2", "v1"), "utf8")).toBe("b");
+    expect(fs.readFileSync(path.join(`${own}.bak-cpr`, "s1", "v1"), "utf8")).toBe("private");
+  });
+
+  it("keeps sessions private with sessions: false", () => {
+    writeProfile("acc-b", { env: {} });
+    const dir = prepareAccountDir("acc-b", { sessions: false });
+    expect(fs.existsSync(path.join(dir, "projects"))).toBe(false);
   });
 });
 

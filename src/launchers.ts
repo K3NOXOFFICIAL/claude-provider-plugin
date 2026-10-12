@@ -110,6 +110,7 @@ export function saveLauncher(
   if (launcher.inference && launcher.inference !== launcher.profile) clean.inference = launcher.inference;
   if (launcher.model) clean.model = launcher.model;
   if (launcher.share === false) clean.share = false;
+  if (launcher.sessions === false) clean.sessions = false;
   if (launcher.args?.length) clean.args = launcher.args;
 
   all[name] = clean;
@@ -129,6 +130,7 @@ export function removeLauncher(name: string): void {
 export function describeLauncher(l: Launcher): string {
   const parts = [l.profile];
   parts.push(l.home ? "(~/.claude login)" : "(own config dir)");
+  if (!l.home && (l.sessions === false || l.share === false)) parts.push("own sessions");
   if (l.inference) parts.push(`→ inference via ${l.inference}`);
   if (l.model) parts.push(`model ${l.model}`);
   if (l.args?.length) parts.push(`args: ${l.args.join(" ")}`);

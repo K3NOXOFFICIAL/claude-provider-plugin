@@ -115,7 +115,7 @@ function handleCredentialCommand(action: string, profile?: string): void {
   }
 }
 
-const RUN_FLAGS = "[--inference <profile>] [--model <id>] [--home] [--no-share] [-- <claude args>]";
+const RUN_FLAGS = "[--inference <profile>] [--model <id>] [--home] [--no-share] [--own-sessions] [-- <claude args>]";
 const RUN_USAGE = `Usage: cpr run <profile> ${RUN_FLAGS}`;
 const LAUNCHER_USAGE = [
   "Usage:",
@@ -144,6 +144,7 @@ function parseRunArgs(argv: string[], maxPositionals: number): ParsedRun {
     else if (arg === "--model") parsed.opts.model = argv[++i];
     else if (arg === "--home") parsed.opts.home = true;
     else if (arg === "--no-share") parsed.opts.share = false;
+    else if (arg === "--own-sessions") parsed.opts.sessions = false;
     else if (parsed.positionals.length < maxPositionals) parsed.positionals.push(arg);
     else parsed.claudeArgs.push(arg);
   }

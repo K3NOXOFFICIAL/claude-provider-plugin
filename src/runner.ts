@@ -30,7 +30,13 @@ import { PROXY_ADDON_PY } from "./proxy-addon.js";
  * instead would disable Remote Control.
  */
 
-const SHARED_ENTRIES = ["skills", "commands", "agents", "plugins", "projects"];
+const SHARED_ENTRIES = ["skills", "commands", "agents", "plugins"];
+/**
+ * Session state shared by every account dir, so a session started under one
+ * account can be resumed (`claude <launcher> --continue`) under another:
+ * transcripts, rewind checkpoints, plans and task lists.
+ */
+export const SESSION_ENTRIES = ["projects", "file-history", "plans", "tasks", "todos"];
 const AUTH_ENV = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"];
 
 /**
@@ -73,6 +79,50 @@ function link(src: string, dest: string): void {
   }
 }
 
+function isLink(file: string): boolean {
+  try {
+    return fs.lstatSync(file).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Link a session entry to the shared one in ~/.claude. A real dir left from
+ * earlier runs is merged in first (nothing is overwritten); anything that
+ * could not be moved stays in `<dest>.bak-cpr`.
+ */
+function linkSessionEntry(src: string, dest: string): void {
+  fs.mkdirSync(src, { recursive: true });
+  if (fs.existsSync(dest) && !isLink(dest) && fs.statSync(dest).isDirectory()) {
+    for (const child of fs.readdirSync(dest)) {
+      const target = path.join(src, child);
+      if (!fs.existsSync(target)) mergeMove(path.join(dest, child), target);
+      else if (fs.statSync(target).isDirectory() && fs.statSync(path.join(dest, child)).isDirectory()) {
+        for (const inner of fs.readdirSync(path.join(dest, child))) {
+          if (!fs.existsSync(path.join(target, inner))) mergeMove(path.join(dest, child, inner), path.join(target, inner));
+        }
+      }
+    }
+    try {
+      fs.rmdirSync(dest);
+    } catch {
+      let backup = `${dest}.bak-cpr`;
+      for (let i = 1; fs.existsSync(backup); i++) backup = `${dest}.bak-cpr${i}`;
+      fs.renameSync(dest, backup);
+    }
+  }
+  link(src, dest);
+}
+
+function mergeMove(from: string, to: string): void {
+  try {
+    fs.renameSync(from, to);
+  } catch {
+    // Left behind; ends up in the .bak-cpr dir.
+  }
+}
+
 /**
  * Drop account-bound caches from an account dir's .claude.json (kept: its own
  * oauthAccount, MCP servers, project trust). Claude refetches them on start.
@@ -97,7 +147,7 @@ export function clearAccountState(dir: string): string[] {
  * commands, agents, plugins and project memory are linked from ~/.claude,
  * settings.json is the user's base settings plus the profile.
  */
-export function prepareAccountDir(name: string, opts: { share?: boolean } = {}): string {
+export function prepareAccountDir(name: string, opts: { share?: boolean; sessions?: boolean } = {}): string {
   const dir = getAccountDir(name);
   fs.mkdirSync(dir, { recursive: true });
 
@@ -113,6 +163,11 @@ export function prepareAccountDir(name: string, opts: { share?: boolean } = {}):
     const md = path.join(dir, "CLAUDE.md");
     const srcMd = path.join(getClaudeDir(), "CLAUDE.md");
     if (!fs.existsSync(md) && fs.existsSync(srcMd)) fs.copyFileSync(srcMd, md);
+    if (opts.sessions !== false) {
+      for (const entry of SESSION_ENTRIES) {
+        linkSessionEntry(path.join(getClaudeDir(), entry), path.join(dir, entry));
+      }
+    }
   }
 
   const ownJson = path.join(dir, ".claude.json");
@@ -335,6 +390,8 @@ export interface RunOptions {
   inference?: string;
   model?: string;
   share?: boolean;
+  /** false: keep this account's sessions separate (default: shared). */
+  sessions?: boolean;
   home?: boolean;
 }
 
@@ -343,7 +400,7 @@ export async function runClaude(name: string, claudeArgs: string[], opts: RunOpt
   if (!settings) throw new Error(`Provider profile not found: settings.${name}.json`);
   const oauth = isOauthProfile(settings);
 
-  const dir = opts.home ? null : prepareAccountDir(name, { share: opts.share });
+  const dir = opts.home ? null : prepareAccountDir(name, { share: opts.share, sessions: opts.sessions });
   const env = buildClaudeEnv(name, dir);
   if (dir && oauth && !hasLogin(dir)) {
     console.error(`First run of ${name}: type /login in claude and sign in with this account.`);

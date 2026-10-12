@@ -172,7 +172,7 @@ cpr run anthropic-main        # terminal 1
 cpr run anthropic-secondary   # terminal 2: first run asks for /login, then it's remembered
 ```
 
-Each is a normal claude.ai login, so Remote Control works in both. Skills, commands, agents, plugins and project memory are shared with `~/.claude` via links (`--no-share` to opt out); `settings.json` is seeded from your global one plus the profile. Extra arguments go to claude: `cpr run anthropic-main -- --resume`.
+Each is a normal claude.ai login, so Remote Control works in both. Skills, commands, agents and plugins are shared with `~/.claude` via links (`--no-share` to opt out), and so are sessions (see Shared Sessions); `settings.json` is seeded from your global one plus the profile. Extra arguments go to claude: `cpr run anthropic-main -- --resume`.
 
 ### Remote Control on A, inference through B (or a `/v1` gateway)
 
@@ -212,6 +212,22 @@ Each launcher can be started three ways: `claude <name>` (after `install-shell`)
 - Launcher names cannot shadow claude subcommands (`mcp`, `update`, `remote-control`, …).
 - Isolated account dirs start from your MCP servers and project trust only, never your main account's cached flags or Remote Control state. On every start they also pick up folders newly trusted in `~/.claude.json`. Dirs seeded by an older version can be cleaned with `cpr account-clean <profile...>`.
 - The first `claude remote-control` in a new account dir asks "Enable Remote Control? (y/n)" once. It refuses to run from your home directory; start it from a project folder.
+
+### Shared Sessions (switch accounts mid-session)
+
+All accounts use the same sessions: transcripts and project memory (`projects`), rewind checkpoints (`file-history`), `plans`, `tasks` and `todos` in every account dir are links to `~/.claude`. When one subscription hits its limit, exit and continue the same conversation on the other:
+
+```bash
+claude keno              # ... "You've hit your session limit"
+claude nils --continue   # same folder: picks up the latest session
+claude nils --resume     # or pick any session
+```
+
+- Run a session in one account at a time; two processes writing the same session will fork or corrupt it.
+- Thinking is bound to the account's organization. After a switch, Claude Code notes it "can't use thinking from another organization", rereads the session and carries on (one-time extra tokens).
+- Private session dirs from earlier runs are merged into the shared ones on the next start. Nothing is overwritten; leftovers stay in `<dir>.bak-cpr`.
+- Prompt history (up-arrow) stays per account.
+- To keep one account separate: `--own-sessions` on `cpr run` or `cpr launcher add|set`.
 
 ### Custom `/v1` Gateways
 
