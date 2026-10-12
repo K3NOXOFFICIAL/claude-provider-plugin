@@ -16,6 +16,7 @@ import {
   hasLogin,
   splitModelEnv,
   SESSION_ENTRIES,
+  claudeBin,
 } from "../src/runner.js";
 import { PROXY_ADDON_PY } from "../src/proxy-addon.js";
 
@@ -343,3 +344,23 @@ out["count_tokens_untouched"] = [f.request.host, f.request.headers.get("authoriz
 out["other_host_untouched"] = call("POST", "example.org", "/v1/messages", {"model": "x"}).request.host
 print(json.dumps(out))
 `;
+
+describe("claudeBin", () => {
+  const exe = process.platform === "win32" ? "claude.exe" : "claude";
+
+  it("falls back to ~/.local/bin when claude is not on PATH", () => {
+    const bin = path.join(home, ".local", "bin");
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(path.join(bin, exe), "");
+    expect(claudeBin({ PATH: path.join(home, "empty") })).toBe(path.join(bin, exe));
+  });
+
+  it("prefers CPR_CLAUDE_BIN, then PATH", () => {
+    const onPath = path.join(home, "p");
+    fs.mkdirSync(onPath);
+    fs.writeFileSync(path.join(onPath, exe), "");
+    expect(claudeBin({ CPR_CLAUDE_BIN: "x", PATH: onPath })).toBe("x");
+    expect(claudeBin({ PATH: onPath })).toBe(path.join(onPath, exe));
+    expect(claudeBin({ PATH: "" })).toBe("claude");
+  });
+});

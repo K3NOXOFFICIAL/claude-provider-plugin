@@ -366,8 +366,20 @@ function findMitmdump(): string | null {
   return res.error ? null : bin;
 }
 
-function claudeBin(): string {
-  return process.env.CPR_CLAUDE_BIN || "claude";
+/**
+ * The claude executable: CPR_CLAUDE_BIN, else `claude` on PATH, else the
+ * native installer's ~/.local/bin (often cut off the end of a long Windows PATH).
+ */
+export function claudeBin(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.CPR_CLAUDE_BIN) return env.CPR_CLAUDE_BIN;
+  const exe = process.platform === "win32" ? "claude.exe" : "claude";
+  const dirs = (env.PATH ?? env.Path ?? "").split(path.delimiter).filter(Boolean);
+  dirs.push(path.join(os.homedir(), ".local", "bin"));
+  for (const dir of dirs) {
+    const file = path.join(dir, exe);
+    if (fs.existsSync(file)) return file;
+  }
+  return "claude";
 }
 
 function forwardExit(child: ChildProcess, cleanup: () => void): Promise<number> {
