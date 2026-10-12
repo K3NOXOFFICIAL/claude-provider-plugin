@@ -7,6 +7,7 @@ import {
   duplicateProfile,
   addClaudeAccount,
 } from "./profiles.js";
+import { runClaude } from "./runner.js";
 import { runInteractiveMenu } from "./interactive.js";
 import { mcpServer } from "./mcp.js";
 import {
@@ -104,6 +105,44 @@ function handleCredentialCommand(action: string, profile?: string): void {
   }
 }
 
+const RUN_USAGE =
+  "Usage: cpr run <profile> [--inference <profile>] [--model <id>] [--no-share] [-- <claude args>]";
+
+/**
+ * `cpr run`: start claude in an isolated per-profile config dir, so several
+ * accounts/gateways can run at once; --inference splits the RC login from the
+ * profile that serves the model calls.
+ */
+async function handleRunCommand(argv: string[]): Promise<void> {
+  const claudeArgs: string[] = [];
+  const opts: { inference?: string; model?: string; share?: boolean } = {};
+  let profile: string | undefined;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--") {
+      claudeArgs.push(...argv.slice(i + 1));
+      break;
+    } else if (arg === "--inference") opts.inference = argv[++i];
+    else if (arg === "--model") opts.model = argv[++i];
+    else if (arg === "--no-share") opts.share = false;
+    else if (!profile) profile = arg;
+    else claudeArgs.push(arg);
+  }
+
+  if (!profile) fail(RUN_USAGE);
+  const known = listProfiles().map((p) => p.name);
+  for (const name of [profile, opts.inference]) {
+    if (name && !known.includes(name)) fail(`Provider not installed: ${name}`);
+  }
+
+  try {
+    process.exitCode = await runClaude(profile, claudeArgs, opts);
+  } catch (e) {
+    fail(e instanceof Error ? e.message : String(e));
+  }
+}
+
 /**
  * Create and configure the CLI program
  */
@@ -114,7 +153,7 @@ export function createProgram(): Command {
     .version("0.1.0")
     .argument(
       "[provider]",
-      "provider name to switch to, or: mcp | credential | duplicate | add-account"
+      "provider name to switch to, or: mcp | credential | duplicate | add-account | run"
     )
     .argument("[arg1]", "credential: save|restore|clear|list; duplicate: source; add-account: name")
     .argument("[arg2]", "credential: profile; duplicate: new name")
@@ -126,6 +165,11 @@ export function createProgram(): Command {
  * Run the CLI application
  */
 export async function runCli(): Promise<void> {
+  if (process.argv[2] === "run") {
+    await handleRunCommand(process.argv.slice(3));
+    return;
+  }
+
   const program = createProgram();
   program.parse(process.argv);
 

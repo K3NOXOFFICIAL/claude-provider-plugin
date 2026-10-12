@@ -247,42 +247,11 @@ export function switchToProvider(name: string): string {
   if (!newSettings) {
     throw new Error(`Failed to read profile: settings.${name}.json`);
   }
-  const normalizedSettings = normalizeProviderSettings(newSettings);
 
   // Read current settings to preserve non-provider-specific fields
   const currentSettings = readSettings(dest);
 
-  // Merge: start with current settings as base, then apply new profile's env
-  // This preserves all user settings (permissions, attribution, etc.) while
-  // only updating the provider-specific env vars
-  const mergedSettings: Settings = {
-    ...currentSettings,
-    ...normalizedSettings,
-    // Deep merge env: combine current env with new profile's env vars
-    // New profile's env vars take precedence for conflicts
-    env: {
-      ...currentSettings?.env,
-      ...normalizedSettings.env,
-    },
-    // Deep merge enabledPlugins: combine both current and new
-    enabledPlugins: {
-      ...currentSettings?.enabledPlugins,
-      ...normalizedSettings.enabledPlugins,
-    },
-  };
-
-  if (!normalizedSettings.apiKeyHelper) {
-    delete mergedSettings.apiKeyHelper;
-  }
-  if (!normalizedSettings.model) {
-    delete mergedSettings.model;
-  }
-
-  for (const key of PROVIDER_ENV_KEYS) {
-    if (!(key in (normalizedSettings.env ?? {}))) {
-      delete mergedSettings.env[key];
-    }
-  }
+  const mergedSettings = mergeProfileSettings(currentSettings, newSettings);
 
   // Write merged settings
   writeSettings(dest, mergedSettings);
@@ -293,6 +262,39 @@ export function switchToProvider(name: string): string {
   writeActiveProfileMarker(name);
 
   return dest;
+}
+
+/**
+ * Apply a normalized profile on top of existing settings, keeping every
+ * non-provider setting and dropping provider keys the profile doesn't set.
+ */
+export function mergeProfileSettings(
+  currentSettings: Settings | null,
+  profileSettings: Settings
+): Settings {
+  const normalizedSettings = normalizeProviderSettings(profileSettings);
+  const mergedSettings: Settings = {
+    ...currentSettings,
+    ...normalizedSettings,
+    env: {
+      ...currentSettings?.env,
+      ...normalizedSettings.env,
+    },
+    enabledPlugins: {
+      ...currentSettings?.enabledPlugins,
+      ...normalizedSettings.enabledPlugins,
+    },
+  };
+
+  if (!normalizedSettings.apiKeyHelper) delete mergedSettings.apiKeyHelper;
+  if (!normalizedSettings.model) delete mergedSettings.model;
+
+  for (const key of PROVIDER_ENV_KEYS) {
+    if (!(key in (normalizedSettings.env ?? {}))) {
+      delete mergedSettings.env[key];
+    }
+  }
+  return mergedSettings;
 }
 
 function normalizeProviderSettings(settings: Settings): Settings {

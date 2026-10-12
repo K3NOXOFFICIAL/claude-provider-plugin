@@ -163,6 +163,33 @@ cpr anthropic-secondary
 
 Other helpers: `cpr credential save|restore|clear|list [profile]`. Disable auto-swapping with `CPR_SWAP_CREDENTIALS=0`. Restart Claude Code after switching accounts.
 
+### Two Accounts at the Same Time (Remote Control on both)
+
+`cpr switch` changes the one global login. To run several sessions concurrently, use `cpr run`, which gives each profile its own config dir (`~/.claude-accounts/<name>`, via `CLAUDE_CONFIG_DIR`):
+
+```bash
+cpr run anthropic-main        # terminal 1
+cpr run anthropic-secondary   # terminal 2: first run asks for /login, then it's remembered
+```
+
+Each is a normal claude.ai login, so Remote Control works in both. Skills, commands, agents, plugins and project memory are shared with `~/.claude` via links (`--no-share` to opt out); `settings.json` is seeded from your global one plus the profile. Extra arguments go to claude: `cpr run anthropic-main -- --resume`.
+
+### Remote Control on A, inference through B (or a `/v1` gateway)
+
+Claude Code turns Remote Control off when `ANTHROPIC_BASE_URL` points anywhere but api.anthropic.com, so the redirect has to happen outside the process. Split mode starts a local [mitmproxy](https://mitmproxy.org) that rewrites only `POST /v1/messages` for that one session:
+
+```bash
+cpr run anthropic-main --inference anthropic-secondary   # RC login = main, model calls billed to secondary
+cpr run anthropic-main --inference my-gateway            # RC login = main, model calls go to your /v1 gateway
+cpr run anthropic-main --inference my-gateway --model some-model-id
+```
+
+Requirements and limits:
+- Install mitmproxy (`pipx install mitmproxy`) and run `mitmdump` once so its CA exists; the CA is trusted for that claude process only (`NODE_EXTRA_CA_CERTS`).
+- The session profile (A) must be a claude.ai login profile. B can be a gateway profile (needs `ANTHROPIC_BASE_URL` + key) or another account that you have run once with `cpr run` (its token is read from its config dir; if it has expired, run that account once to refresh it). B-as-account is not supported on macOS.
+- Stateful "thread" turns that a claude.ai login uses can't be served by another backend, so the proxy refuses them and Claude Code falls back to stateless requests.
+- Using one account's session to spend another account's subscription may conflict with Anthropic's terms; check before relying on it.
+
 ### Custom `/v1` Gateways
 
 Custom profiles accept a base URL with or without a trailing `/v1` (Claude Code appends `/v1/messages` itself, so `/v1` is stripped), and can fetch the model list from `<base>/v1/models`. The endpoint must speak the **Anthropic Messages API**; pure OpenAI `/chat/completions` endpoints need a translating gateway in front.
