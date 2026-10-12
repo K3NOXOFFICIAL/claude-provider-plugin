@@ -90,6 +90,22 @@ describe("Claude account swapping", () => {
     expect(detectActiveProfile(listProfiles())).toBe("anthropic-secondary");
   });
 
+  it("logs out instead of keeping the old account when the target has no saved login", () => {
+    writeProfile("keno", { env: {} });
+    writeProfile("nils", { env: {} });
+    fs.writeFileSync(claudeJson(), JSON.stringify({ oauthAccount: account("keno@x") }));
+    writeLiveCredential("TOKEN-KENO");
+    switchProfile("keno");
+
+    const { notes } = switchProfile("nils");
+    expect(readLiveCredential()).toBeNull();
+    expect(JSON.parse(fs.readFileSync(claudeJson(), "utf8")).oauthAccount).toBeUndefined();
+    expect(notes.join(" ")).toMatch(/logged out locally/);
+
+    switchProfile("keno");
+    expect(readLiveCredential()).toBe("TOKEN-KENO");
+  });
+
   it("does not touch the login when switching to an API-key profile", () => {
     writeProfile("anthropic-main", { env: {} });
     writeProfile("kimi", { env: { ANTHROPIC_BASE_URL: "https://k" }, apiKeyHelper: "x" });

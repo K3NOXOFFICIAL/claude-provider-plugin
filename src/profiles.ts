@@ -380,12 +380,13 @@ export function switchProfile(name: string): { path: string; notes: string[] } {
   const notes: string[] = [];
   const swap = isCredentialSwapEnabled();
   const outgoing = swap ? detectActiveProfile(listProfiles()) : null;
+  let outgoingSaved = false;
 
   if (swap && outgoing && outgoing !== name) {
     const outSettings = readSettings(getProfilePath(outgoing));
     if (isOauthProfile(outSettings) && readLiveCredential()) {
-      const res = saveCredentialForProfile(outgoing);
-      if (res.saved) notes.push(`saved Claude login for ${outgoing}`);
+      outgoingSaved = saveCredentialForProfile(outgoing).saved;
+      if (outgoingSaved) notes.push(`saved Claude login for ${outgoing}`);
     }
   }
 
@@ -396,9 +397,15 @@ export function switchProfile(name: string): { path: string; notes: string[] } {
       const res = restoreCredentialForProfile(name);
       if (res.restored) notes.push(`restored Claude login for ${name}`);
       else notes.push(`login restore skipped: ${res.reason}`);
+    } else if (outgoingSaved) {
+      // Never leave the previous account's login active under this profile's name.
+      clearLogin();
+      notes.push(
+        `no saved Claude login for ${name}: logged out locally; run claude and /login as this account (it is saved when you switch away)`
+      );
     } else {
       notes.push(
-        `no saved Claude login for ${name}; run claude and /login once (it is saved when you switch away)`
+        `no saved Claude login for ${name}; the current login was kept because it is not saved anywhere — run /login as this account`
       );
     }
   }
