@@ -418,6 +418,33 @@ describe("activateHomeLogin (one ~/.claude, swapped login)", () => {
     expect(fs.readFileSync(path.join(home, ".claude", ".active-profile"), "utf8").trim()).toBe("acc-k");
   });
 
+  it("keeps MCP OAuth tokens and trusts the refresh token over a stale oauthAccount", () => {
+    fs.writeFileSync(
+      path.join(home, ".claude", ".credentials.json"),
+      JSON.stringify({ ...JSON.parse(cred("k1", 100)), mcpOAuth: { srv: { accessToken: "m" } } })
+    );
+    fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: "keno" } }));
+    fs.writeFileSync(
+      path.join(home, ".claude", "credentials.acc-k.json"),
+      JSON.stringify({ version: 1, credential: cred("k1", 100), oauthAccount: { accountUuid: "keno" } })
+    );
+    fs.writeFileSync(
+      path.join(home, ".claude", "credentials.acc-n.json"),
+      JSON.stringify({ version: 1, credential: cred("n1", 200), oauthAccount: { accountUuid: "nils" } })
+    );
+    activateHomeLogin("acc-n");
+    expect(JSON.parse(live())).toEqual({ ...JSON.parse(cred("n1", 200)), mcpOAuth: { srv: { accessToken: "m" } } });
+    // A keno process still running rewrites oauthAccount; the token is still nils's.
+    fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: "keno" } }));
+    activateHomeLogin("acc-k");
+    expect(JSON.parse(live()).claudeAiOauth.accessToken).toBe("k1");
+    expect(JSON.parse(live()).mcpOAuth).toEqual({ srv: { accessToken: "m" } });
+    const savedNils = JSON.parse(fs.readFileSync(path.join(home, ".claude", "credentials.acc-n.json"), "utf8"));
+    expect(savedNils.oauthAccount).toEqual({ accountUuid: "nils" });
+    const savedKeno = JSON.parse(fs.readFileSync(path.join(home, ".claude", "credentials.acc-k.json"), "utf8"));
+    expect(JSON.parse(savedKeno.credential).claudeAiOauth.accessToken).toBe("k1");
+  });
+
   it("logs out locally for a profile with no login, keeping an unowned login as a backup", () => {
     setLive("x1", 100, "stranger");
     const notes = activateHomeLogin("acc-n");

@@ -17,18 +17,18 @@ import {
   getProfileFilePath,
   isOauthProfile,
   listProfiles,
-  profileExists,
   mergeProfileSettings,
   readActiveProfileMarker,
   writeActiveProfileMarker,
 } from "./profiles.js";
 import {
-  clearLogin,
+  clearLiveCredential,
   getCredentialPath,
   readLiveCredential,
   readOauthAccount,
   readSavedLogin,
-  restoreCredentialForProfile,
+  writeLiveCredential,
+  writeOauthAccount,
 } from "./credentials.js";
 import { PROXY_ADDON_PY } from "./proxy-addon.js";
 
@@ -318,46 +318,81 @@ function liveHomeSessions(): number {
   return count;
 }
 
+function oauthPart(credential: string | null | undefined): Record<string, unknown> | null {
+  try {
+    const part = JSON.parse(credential ?? "").claudeAiOauth;
+    return part?.accessToken ? part : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Put `login`'s claude.ai token (or none) into the live credential, keeping
+ * everything else stored there, such as MCP server OAuth tokens.
+ */
+function setLiveOauth(login: Login | null): void {
+  let current: Record<string, unknown> = {};
+  try {
+    current = JSON.parse(readLiveCredential() ?? "{}");
+  } catch {
+    // Unreadable: start over.
+  }
+  delete current.claudeAiOauth;
+  const part = login ? oauthPart(login.credential) : null;
+  if (part) current.claudeAiOauth = part;
+  if (Object.keys(current).length > 0) writeLiveCredential(JSON.stringify(current));
+  else clearLiveCredential();
+  writeOauthAccount(login?.oauthAccount ?? null);
+}
+
 /**
  * Make `name`'s claude.ai login the live one in ~/.claude, keeping every other
- * file (settings, memory, sessions) as it is. The outgoing login is saved
- * first under the profile it belongs to, found by account, not by name.
+ * file (settings, memory, sessions, MCP logins) as it is. The outgoing login
+ * is saved first under the profile it belongs to: the one holding the same
+ * refresh token, else the same account, else the profile last activated.
  */
 export function activateHomeLogin(name: string): string[] {
   const notes: string[] = [];
   const target = loginFor(name);
   const live = readLiveCredential();
+  const liveOauth = oauthPart(live);
   const liveAccount = readOauthAccount();
   const liveId = accountId(liveAccount);
 
-  if (live && liveId && target && accountId(target.oauthAccount) === liveId) {
-    if (expiresAt(live) >= expiresAt(target.credential)) writeSavedLogin(name, { credential: live, oauthAccount: liveAccount });
-    else restoreCredentialForProfile(name);
-    writeActiveProfileMarker(name);
-    return notes;
+  const loginProfiles = listProfiles()
+    .map((p) => p.name)
+    .filter((p) => isOauthProfile(readSettings(getProfileFilePath(p))));
+  const sameToken = (p: string): boolean =>
+    Boolean(liveOauth?.refreshToken) && oauthPart(loginFor(p)?.credential)?.refreshToken === liveOauth?.refreshToken;
+  let owners = loginProfiles.filter(sameToken);
+  if (owners.length === 0 && liveId) {
+    owners = loginProfiles.filter((p) => accountId(loginFor(p)?.oauthAccount) === liveId);
   }
+  const marked = readActiveProfileMarker();
+  if (owners.length === 0 && marked && loginProfiles.includes(marked) && !loginFor(marked)) owners = [marked];
 
-  if (live) {
-    const owners = listProfiles()
-      .map((p) => p.name)
-      .filter((p) => p !== name && isOauthProfile(readSettings(getProfileFilePath(p))))
-      .filter((p) => liveId && accountId(loginFor(p)?.oauthAccount) === liveId);
-    // Not saved anywhere yet: it belongs to the profile last activated, if that one has no login.
-    const marked = readActiveProfileMarker();
-    if (owners.length === 0 && marked && marked !== name && profileExists(marked) && !loginFor(marked)) {
-      if (isOauthProfile(readSettings(getProfileFilePath(marked)))) owners.push(marked);
-    }
-    if (owners.length > 0) {
-      for (const owner of owners) {
-        if (expiresAt(live) >= expiresAt(loginFor(owner)?.credential)) {
-          writeSavedLogin(owner, { credential: live, oauthAccount: liveAccount });
-        }
+  if (liveOauth) {
+    for (const owner of owners) {
+      const saved = loginFor(owner);
+      if (expiresAt(live) >= expiresAt(saved?.credential)) {
+        // The token decides whose login this is; keep that profile's account info.
+        const account = sameToken(owner) ? (saved?.oauthAccount ?? liveAccount) : liveAccount;
+        writeSavedLogin(owner, { credential: JSON.stringify({ claudeAiOauth: liveOauth }), oauthAccount: account });
       }
-    } else {
+    }
+    if (owners.length === 0) {
       const backup = path.join(getClaudeDir(), ".credentials.json.bak-cpr");
-      fs.writeFileSync(backup, live, { mode: 0o600 });
+      fs.writeFileSync(backup, live ?? "", { mode: 0o600 });
       notes.push(`The current login (${accountEmail(liveAccount)}) belongs to no profile; kept a copy in ${backup}.`);
     }
+  }
+
+  if (liveOauth && owners.includes(name)) {
+    const fresh = loginFor(name);
+    if (fresh && expiresAt(fresh.credential) > expiresAt(live)) setLiveOauth(fresh);
+    writeActiveProfileMarker(name);
+    return notes;
   }
 
   const others = liveHomeSessions();
@@ -365,13 +400,12 @@ export function activateHomeLogin(name: string): string[] {
     notes.push(`${others} other claude session(s) use ~/.claude and switch to this account too.`);
   }
 
-  if (target) {
-    restoreCredentialForProfile(name);
-    notes.push(`Signed in as ${accountEmail(target.oauthAccount)} (${name}).`);
-  } else {
-    clearLogin();
-    notes.push(`No saved login for ${name}: type /login in claude and sign in with this account.`);
-  }
+  setLiveOauth(target);
+  notes.push(
+    target
+      ? `Signed in as ${accountEmail(target.oauthAccount)} (${name}).`
+      : `No saved login for ${name}: type /login in claude and sign in with this account.`
+  );
   writeActiveProfileMarker(name);
   return notes;
 }
