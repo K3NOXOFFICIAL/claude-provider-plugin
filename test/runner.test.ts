@@ -12,6 +12,9 @@ import {
   getAccountDir,
   prepareAccountDir,
   runClaude,
+  clearAccountState,
+  hasLogin,
+  splitModelEnv,
 } from "../src/runner.js";
 import { PROXY_ADDON_PY } from "../src/proxy-addon.js";
 
@@ -47,7 +50,13 @@ describe("prepareAccountDir", () => {
     );
     fs.writeFileSync(
       path.join(home, ".claude.json"),
-      JSON.stringify({ oauthAccount: { emailAddress: "a@x" }, mcpServers: { s: {} } })
+      JSON.stringify({
+        oauthAccount: { emailAddress: "a@x" },
+        mcpServers: { s: {} },
+        cachedGrowthBookFeatures: { rc: true },
+        replBridgePlaceholders: { x: 1 },
+        remoteControlMachineId: "m",
+      })
     );
     writeProfile("acc-b", { env: {} });
 
@@ -56,10 +65,74 @@ describe("prepareAccountDir", () => {
     const settings = JSON.parse(fs.readFileSync(path.join(dir, "settings.json"), "utf8"));
     expect(settings.permissions).toEqual({ allow: ["Bash"] });
     const json = JSON.parse(fs.readFileSync(path.join(dir, ".claude.json"), "utf8"));
-    expect(json.oauthAccount).toBeUndefined();
-    expect(json.mcpServers).toEqual({ s: {} });
+    expect(json).toEqual({ mcpServers: { s: {} } });
     expect(buildClaudeEnv("acc-b", dir, { ANTHROPIC_BASE_URL: "https://x" }).ANTHROPIC_BASE_URL).toBeUndefined();
     expect(buildClaudeEnv("acc-b", dir, {}).CLAUDE_CONFIG_DIR).toBe(dir);
+    expect(hasLogin(dir)).toBe(false);
+  });
+
+  it("inherits folder trust from ~/.claude.json on later runs without touching other state", () => {
+    fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+    writeProfile("acc-b", { env: {} });
+    fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ projects: {} }));
+    const dir = prepareAccountDir("acc-b");
+    const own = path.join(dir, ".claude.json");
+    fs.writeFileSync(own, JSON.stringify({ oauthAccount: { emailAddress: "b@x" }, projects: { "C:/p1": { allowedTools: ["x"] } } }));
+    fs.writeFileSync(
+      path.join(home, ".claude.json"),
+      JSON.stringify({ projects: { "C:/p1": { hasTrustDialogAccepted: true }, "C:/p2": { hasTrustDialogAccepted: false } } })
+    );
+    prepareAccountDir("acc-b");
+    expect(JSON.parse(fs.readFileSync(own, "utf8"))).toEqual({
+      oauthAccount: { emailAddress: "b@x" },
+      projects: { "C:/p1": { allowedTools: ["x"], hasTrustDialogAccepted: true } },
+    });
+  });
+
+  it("clearAccountState drops account-bound caches but keeps the dir's own login", () => {
+    const dir = path.join(home, "acct");
+    fs.mkdirSync(dir);
+    fs.writeFileSync(
+      path.join(dir, ".claude.json"),
+      JSON.stringify({ oauthAccount: { emailAddress: "b@x" }, mcpServers: {}, cachedGrowthBookFeatures: {}, remoteControlMachineId: "m", replBridgePlaceholders: {} })
+    );
+    expect(clearAccountState(dir).sort()).toEqual(["cachedGrowthBookFeatures", "remoteControlMachineId", "replBridgePlaceholders"]);
+    expect(JSON.parse(fs.readFileSync(path.join(dir, ".claude.json"), "utf8"))).toEqual({
+      oauthAccount: { emailAddress: "b@x" },
+      mcpServers: {},
+    });
+  });
+});
+
+describe("buildClaudeEnv on ~/.claude (home)", () => {
+  it("applies a gateway profile per process and leaves CLAUDE_CONFIG_DIR unset", () => {
+    writeProfile("gw", {
+      apiKeyHelper: createApiKeyHelper("KEY"),
+      env: { ANTHROPIC_BASE_URL: "https://gw", ANTHROPIC_MODEL: "m1" },
+    });
+    const env = buildClaudeEnv("gw", null, { CLAUDE_CONFIG_DIR: "x", ANTHROPIC_API_KEY: "old" });
+    expect(env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(env).toMatchObject({
+      ANTHROPIC_BASE_URL: "https://gw",
+      ANTHROPIC_AUTH_TOKEN: "KEY",
+      ANTHROPIC_MODEL: "m1",
+      ENABLE_TOOL_SEARCH: "true",
+    });
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+});
+
+describe("splitModelEnv", () => {
+  it("advertises the gateway tiers unless already set", () => {
+    const cfg = { mode: "gateway" as const, tiers: { opus: "o", sonnet: "s", haiku: "h" } };
+    expect(splitModelEnv(cfg, {})).toEqual({
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "o",
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "s",
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: "h",
+      ANTHROPIC_MODEL: "s",
+    });
+    expect(splitModelEnv(cfg, { ANTHROPIC_MODEL: "mine" }).ANTHROPIC_MODEL).toBeUndefined();
+    expect(splitModelEnv({ mode: "oauth", tiers: {} }, {})).toEqual({});
   });
 });
 
@@ -139,4 +212,91 @@ describe("proxy addon", () => {
     const res = spawnSync(py, ["-c", `import ast,sys;ast.parse(open(sys.argv[1],encoding="utf-8").read())`, file]);
     expect(res.status).toBe(0);
   });
+
+  it("routes only POST /v1/messages and handles threads, tiers and headers", () => {
+    const py = ["python", "python3", "py"].find((c) => spawnSync(c, ["--version"]).status === 0);
+    if (!py) return;
+    const addon = path.join(home, "addon.py");
+    fs.writeFileSync(addon, PROXY_ADDON_PY);
+    const cfg = path.join(home, "cfg.json");
+    fs.writeFileSync(
+      cfg,
+      JSON.stringify({
+        mode: "gateway",
+        scheme: "https",
+        host: "gw.example",
+        port: 443,
+        basePath: "",
+        token: "GWKEY",
+        tiers: { opus: "auto/claude-opus", sonnet: "auto/claude-sonnet", haiku: "auto/claude-sonnet" },
+      })
+    );
+    const harness = path.join(home, "harness.py");
+    fs.writeFileSync(harness, ADDON_HARNESS);
+    const res = spawnSync(py, ["-I", harness, addon, cfg], { encoding: "utf8" });
+    expect(res.stderr).toBe("");
+    expect(JSON.parse(res.stdout)).toEqual({
+      thread: [400, "thread_unsupported_request"],
+      opus: ["gw.example", "/v1/messages", "auto/claude-opus", "Bearer GWKEY", null, "ctx-1m"],
+      onem: "auto/claude-sonnet",
+      slash: "auto/custom",
+      count_tokens_untouched: ["api.anthropic.com", "Bearer OAUTH"],
+      other_host_untouched: "example.org",
+    });
+  });
 });
+
+const ADDON_HARNESS = String.raw`
+import json, sys, types
+
+class Headers(dict):
+    def get(self, k, d=None): return super().get(k.lower(), d)
+    def __setitem__(self, k, v): super().__setitem__(k.lower(), v)
+    def __getitem__(self, k): return super().__getitem__(k.lower())
+    def __delitem__(self, k): super().__delitem__(k.lower())
+    def pop(self, k, d=None): return super().pop(k.lower(), d)
+
+class Response:
+    def __init__(self, status, body, headers):
+        self.status_code, self.body, self.headers, self.stream = status, body, Headers(headers), False
+    @staticmethod
+    def make(status, body, headers): return Response(status, body, headers)
+
+class Request:
+    def __init__(self, method, host, path, body, headers):
+        self.method, self.host, self.pretty_host, self.path = method, host, host, path
+        self.scheme, self.port, self._body, self.headers = "https", 443, body, Headers(headers)
+    def get_text(self): return self._body
+    def set_text(self, t): self._body = t
+
+class Flow:
+    def __init__(self, req): self.request, self.response, self.metadata = req, None, {}
+
+mitm = types.ModuleType("mitmproxy"); http = types.ModuleType("mitmproxy.http")
+http.Response, http.HTTPFlow = Response, Flow
+mitm.http = http
+sys.modules["mitmproxy"], sys.modules["mitmproxy.http"] = mitm, http
+
+import os
+os.environ["CPR_PROXY_CONFIG"] = sys.argv[2]
+ns = {}
+exec(open(sys.argv[1], encoding="utf-8").read(), ns)
+
+def call(method, host, path, body, headers=None):
+    f = Flow(Request(method, host, path, json.dumps(body), headers or {"authorization": "Bearer OAUTH", "x-api-key": "k", "anthropic-beta": "oauth-2025-04-20,ctx-1m"}))
+    ns["request"](f)
+    return f
+
+out = {}
+f = call("POST", "api.anthropic.com", "/v1/messages", {"model": "claude-opus-5-5", "thread": {"type": "continue"}})
+out["thread"] = [f.response.status_code, json.loads(f.response.body)["error"]["details"]["error_code"]]
+f = call("POST", "api.anthropic.com", "/v1/messages?beta=true", {"model": "claude-opus-5-5"})
+r = f.request
+out["opus"] = [r.host, r.path.split("?")[0], json.loads(r.get_text())["model"], r.headers.get("authorization"), r.headers.get("x-api-key"), r.headers.get("anthropic-beta")]
+out["onem"] = json.loads(call("POST", "api.anthropic.com", "/v1/messages", {"model": "claude-sonnet-5-5[1m]"}).request.get_text())["model"]
+out["slash"] = json.loads(call("POST", "api.anthropic.com", "/v1/messages", {"model": "auto/custom"}).request.get_text())["model"]
+f = call("POST", "api.anthropic.com", "/v1/messages/count_tokens", {"model": "claude-opus-5-5"})
+out["count_tokens_untouched"] = [f.request.host, f.request.headers.get("authorization")]
+out["other_host_untouched"] = call("POST", "example.org", "/v1/messages", {"model": "x"}).request.host
+print(json.dumps(out))
+`;

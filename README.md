@@ -190,6 +190,29 @@ Requirements and limits:
 - Stateful "thread" turns that a claude.ai login uses can't be served by another backend, so the proxy refuses them and Claude Code falls back to stateless requests.
 - Using one account's session to spend another account's subscription may conflict with Anthropic's terms; check before relying on it.
 
+### Start Commands (`claude keno`, `claude nils`, `claude omni`)
+
+Save a start command once, then launch it by name:
+
+```bash
+cpr launcher add keno anthropic-keno --home                         # your normal ~/.claude login
+cpr launcher add nils anthropic-nils                                # second account, own config dir
+cpr launcher add omni anthropic-keno --home --inference omniroute   # RC on keno, models via gateway
+cpr launcher set keno anthropic-keno --home -- --resume             # change one (args after -- go to claude)
+cpr launcher list
+cpr launcher remove nils
+cpr launcher install-shell                                          # enables `claude <name>`
+```
+
+Each launcher can be started three ways: `claude <name>` (after `install-shell`), `claude-<name>` (a shim in `~/.local/bin`, or `CPR_BIN_DIR`), or `cpr launch <name> [claude args]`. The interactive menu has a "Start commands" entry for the same.
+
+- `--home` uses the normal `~/.claude` login and data instead of an isolated dir. For a gateway profile, the provider is applied per process through env vars, so `settings.json` is never touched.
+- `install-shell` appends a marked block to your PowerShell profile (or `~/.bashrc` / `~/.zshrc`). It defines a `claude` function that runs a launcher when the first argument is a launcher name, and otherwise calls whatever `claude` was before. A backup is written as `<profile>.bak-cpr`. PowerShell functions drop a literal `--` argument, so call the previous target directly when you need one.
+- A shim is never written over (or deleted from) a file that cpr did not create. If `claude-<name>` already exists, the launcher still works through `claude <name>` and `cpr launch <name>`.
+- Launcher names cannot shadow claude subcommands (`mcp`, `update`, `remote-control`, …).
+- Isolated account dirs start from your MCP servers and project trust only, never your main account's cached flags or Remote Control state. On every start they also pick up folders newly trusted in `~/.claude.json`. Dirs seeded by an older version can be cleaned with `cpr account-clean <profile...>`.
+- The first `claude remote-control` in a new account dir asks "Enable Remote Control? (y/n)" once. It refuses to run from your home directory; start it from a project folder.
+
 ### Custom `/v1` Gateways
 
 Custom profiles accept a base URL with or without a trailing `/v1` (Claude Code appends `/v1/messages` itself, so `/v1` is stripped), and can fetch the model list from `<base>/v1/models`. The endpoint must speak the **Anthropic Messages API**; pure OpenAI `/chat/completions` endpoints need a translating gateway in front.

@@ -26,8 +26,11 @@ def _error(status, error_type, message, details=None):
 def _map_model(model):
     if CFG.get("forceModel"):
         return CFG["forceModel"]
+    model = str(model or "").split("[")[0]
+    if "/" in model:
+        return model
     tiers = CFG.get("tiers") or {}
-    lowered = (model or "").lower()
+    lowered = model.lower()
     for tier in ("opus", "sonnet", "haiku"):
         if tier in lowered and tiers.get(tier):
             return tiers[tier]
@@ -47,8 +50,8 @@ def _oauth_token():
 
 def request(flow: http.HTTPFlow) -> None:
     r = flow.request
-    path = r.path.split("?")[0]
-    if r.method != "POST" or not path.startswith("/v1/messages"):
+    # Only the model call; count_tokens, OAuth and Remote Control stay with Anthropic.
+    if r.method != "POST" or r.pretty_host != "api.anthropic.com" or r.path.split("?")[0] != "/v1/messages":
         return
 
     body = None
@@ -78,6 +81,7 @@ def request(flow: http.HTTPFlow) -> None:
             flow.response = _error(401, "authentication_error", problem)
             return
         r.headers["authorization"] = "Bearer " + token
+        flow.metadata["cpr_routed"] = True
         return
 
     r.scheme = CFG["scheme"]
@@ -85,9 +89,10 @@ def request(flow: http.HTTPFlow) -> None:
     r.port = CFG["port"]
     r.headers["host"] = CFG["host"]
     r.path = CFG.get("basePath", "") + r.path
+    # The claude.ai OAuth token must never leave for the gateway.
     r.headers.pop("x-api-key", None)
     r.headers["authorization"] = "Bearer " + CFG["token"]
-    r.headers["x-api-key"] = CFG["token"]
+    flow.metadata["cpr_routed"] = True
     betas = r.headers.get("anthropic-beta")
     if betas:
         kept = [b for b in betas.split(",") if not b.strip().startswith("oauth-")]
@@ -98,6 +103,9 @@ def request(flow: http.HTTPFlow) -> None:
 
 
 def responseheaders(flow: http.HTTPFlow) -> None:
-    if flow.response is not None and flow.request.path.startswith("/v1/messages"):
+    # Stream SSE straight through; buffering looks like a hang to Claude Code.
+    if flow.response is None:
+        return
+    if flow.metadata.get("cpr_routed") or "text/event-stream" in flow.response.headers.get("content-type", ""):
         flow.response.stream = True
 `;

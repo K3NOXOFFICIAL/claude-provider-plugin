@@ -4,7 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import type { Settings } from "./types.js";
-import { getClaudeDir, getClaudeJsonPath, getSettingsPath, readSettings, writeSettings, normalizeBaseUrl } from "./utils.js";
+import { MODEL_ENV_KEYS } from "./constants.js";
+import {
+  getClaudeDir,
+  getClaudeJsonPath,
+  getSettingsPath,
+  readSettings,
+  writeSettings,
+  normalizeBaseUrl,
+} from "./utils.js";
 import { getProfileFilePath, isOauthProfile, mergeProfileSettings } from "./profiles.js";
 import { PROXY_ADDON_PY } from "./proxy-addon.js";
 
@@ -13,16 +21,40 @@ import { PROXY_ADDON_PY } from "./proxy-addon.js";
  *
  * Each profile gets its own CLAUDE_CONFIG_DIR (~/.claude-accounts/<name>), so
  * two claude.ai accounts can be logged in at once, each with Remote Control.
+ * With `home`, the session uses the normal ~/.claude dir and its login instead.
  *
- * Split mode (`--inference B`): the session keeps profile A's claude.ai login
- * (so Remote Control stays on) while a local mitmproxy rewrites only the
- * inference call (POST /v1/messages) to go out through profile B, which is
- * either a second Claude account or any Anthropic-compatible /v1 gateway.
- * Setting ANTHROPIC_BASE_URL instead would disable Remote Control.
+ * Split mode (`inference`): the session keeps its claude.ai login (so Remote
+ * Control stays on) while a local mitmproxy rewrites only the inference call
+ * (POST /v1/messages) to go out through another profile: a second Claude
+ * account or any Anthropic-compatible /v1 gateway. Setting ANTHROPIC_BASE_URL
+ * instead would disable Remote Control.
  */
 
 const SHARED_ENTRIES = ["skills", "commands", "agents", "plugins", "projects"];
 const AUTH_ENV = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"];
+
+/**
+ * Keys of ~/.claude.json that are safe to copy into a new account dir. Everything
+ * else there is tied to the logged-in account (feature-flag and model-access
+ * caches, Remote Control bridge state) and must be fetched fresh per account.
+ */
+const SEED_KEYS = [
+  "mcpServers",
+  "projects",
+  "githubRepoPaths",
+  "hasCompletedOnboarding",
+  "lastOnboardingVersion",
+  "installMethod",
+  "autoUpdates",
+  "autoUpdatesProtectedForNative",
+  "hasSeenTasksHint",
+  "lastReleaseNotesSeen",
+  "claudeInChromeDefaultEnabled",
+  "hasCompletedClaudeInChromeOnboarding",
+];
+
+const ACCOUNT_STATE_KEY =
+  /^(cached|replBridge|remoteControl|rcLongTurn|hasUsedRemoteControl|remoteDialogSeen|passes|hasVisitedPasses|groveConfigCache|penguinModeOrgEnabled|subscriptionNoticeCount|hasAvailableSubscription|clientDataCacheSlots|additionalModel|modelAccessCache|orgModelDefaultCache|autoCompactWindowsCache|githubWebConnectionStatusCache|promoStartupStatusCache|claudeAiMcpEverConnected)/;
 
 export function getAccountsRoot(): string {
   return path.join(os.homedir(), ".claude-accounts");
@@ -39,6 +71,25 @@ function link(src: string, dest: string): void {
   } catch {
     // Sharing is a convenience; the profile still works without it.
   }
+}
+
+/**
+ * Drop account-bound caches from an account dir's .claude.json (kept: its own
+ * oauthAccount, MCP servers, project trust). Claude refetches them on start.
+ */
+export function clearAccountState(dir: string): string[] {
+  const file = path.join(dir, ".claude.json");
+  let json: Record<string, unknown>;
+  try {
+    json = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+  } catch {
+    return [];
+  }
+  const removed = Object.keys(json).filter((k) => ACCOUNT_STATE_KEY.test(k));
+  if (removed.length === 0) return [];
+  for (const key of removed) delete json[key];
+  fs.writeFileSync(file, JSON.stringify(json, null, 2) + "\n");
+  return removed;
 }
 
 /**
@@ -64,31 +115,54 @@ export function prepareAccountDir(name: string, opts: { share?: boolean } = {}):
     if (!fs.existsSync(md) && fs.existsSync(srcMd)) fs.copyFileSync(srcMd, md);
   }
 
-  // User-scope MCP servers and trust state live in .claude.json; seed it once, minus the login.
   const ownJson = path.join(dir, ".claude.json");
   if (!fs.existsSync(ownJson) && fs.existsSync(getClaudeJsonPath())) {
     try {
       const json = JSON.parse(fs.readFileSync(getClaudeJsonPath(), "utf8")) as Record<string, unknown>;
-      delete json.oauthAccount;
-      fs.writeFileSync(ownJson, JSON.stringify(json, null, 2) + "\n");
+      const seed = Object.fromEntries(SEED_KEYS.filter((k) => k in json).map((k) => [k, json[k]]));
+      fs.writeFileSync(ownJson, JSON.stringify(seed, null, 2) + "\n");
     } catch {
       // Claude will create a fresh one.
     }
+  } else {
+    inheritFolderTrust(ownJson);
   }
   return dir;
 }
 
-export function buildClaudeEnv(
-  name: string,
-  dir: string,
-  base: NodeJS.ProcessEnv = process.env
-): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...base, CLAUDE_CONFIG_DIR: dir };
-  if (isOauthProfile(readSettings(getProfileFilePath(name)))) {
-    // Inherited gateway vars would disable Remote Control and bypass the login.
-    for (const key of AUTH_ENV) delete env[key];
+type Projects = Record<string, Record<string, unknown>>;
+
+/**
+ * Folder trust is about the folder, not the account: carry over folders
+ * trusted in ~/.claude.json so `claude remote-control` works there too.
+ */
+function inheritFolderTrust(ownJson: string): void {
+  try {
+    const main = JSON.parse(fs.readFileSync(getClaudeJsonPath(), "utf8")) as { projects?: Projects };
+    const own = JSON.parse(fs.readFileSync(ownJson, "utf8")) as { projects?: Projects };
+    let changed = false;
+    for (const [folder, entry] of Object.entries(main.projects ?? {})) {
+      if (entry?.hasTrustDialogAccepted !== true) continue;
+      own.projects ??= {};
+      if (own.projects[folder]?.hasTrustDialogAccepted === true) continue;
+      own.projects[folder] = { ...own.projects[folder], hasTrustDialogAccepted: true };
+      changed = true;
+    }
+    if (changed) fs.writeFileSync(ownJson, JSON.stringify(own, null, 2) + "\n");
+  } catch {
+    // Missing or unreadable state: claude asks for trust itself.
   }
-  return env;
+}
+
+/** True when the config dir holds a claude.ai login (Windows/Linux file store). */
+export function hasLogin(dir: string): boolean {
+  if (process.platform === "darwin") return true;
+  try {
+    const c = JSON.parse(fs.readFileSync(path.join(dir, ".credentials.json"), "utf8"));
+    return Boolean(c?.claudeAiOauth?.accessToken);
+  } catch {
+    return false;
+  }
 }
 
 export function extractApiKey(settings: Settings): string | null {
@@ -96,6 +170,37 @@ export function extractApiKey(settings: Settings): string | null {
   if (direct) return direct;
   const m = settings.apiKeyHelper?.match(/^bash -c 'echo (.*)'$/s);
   return m ? m[1].replace(/'\\''/g, "'") : null;
+}
+
+/**
+ * Environment for the claude process. `dir` null means the normal ~/.claude.
+ */
+export function buildClaudeEnv(
+  name: string,
+  dir: string | null,
+  base: NodeJS.ProcessEnv = process.env
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base };
+  if (dir) env.CLAUDE_CONFIG_DIR = dir;
+  else delete env.CLAUDE_CONFIG_DIR;
+
+  const settings = readSettings(getProfileFilePath(name));
+  if (isOauthProfile(settings)) {
+    // Inherited gateway vars would disable Remote Control and bypass the login.
+    for (const key of AUTH_ENV) delete env[key];
+  } else if (!dir && settings) {
+    // Gateway profile on the shared ~/.claude: apply it per process, never to settings.json.
+    const profileEnv = settings.env ?? {};
+    for (const key of ["ANTHROPIC_BASE_URL", ...MODEL_ENV_KEYS]) {
+      if (profileEnv[key]) env[key] = profileEnv[key];
+    }
+    const token = extractApiKey(settings);
+    if (token) env.ANTHROPIC_AUTH_TOKEN = token;
+    delete env.ANTHROPIC_API_KEY;
+    // Tool search is off for non-Anthropic hosts unless asked for.
+    env.ENABLE_TOOL_SEARCH ??= "true";
+  }
+  return env;
 }
 
 export interface ProxyConfig {
@@ -124,10 +229,10 @@ export function buildProxyConfig(inference: string, opts: { model?: string } = {
   };
 
   if (isOauthProfile(settings)) {
-    const credentialsFile = path.join(getAccountDir(inference), ".credentials.json");
     if (process.platform === "darwin") {
       throw new Error("Using a second Claude account for inference is not supported on macOS (keychain).");
     }
+    const credentialsFile = path.join(getAccountDir(inference), ".credentials.json");
     return { mode: "oauth", credentialsFile, forceModel: opts.model, tiers: {} };
   }
 
@@ -147,6 +252,27 @@ export function buildProxyConfig(inference: string, opts: { model?: string } = {
     forceModel: opts.model,
     tiers,
   };
+}
+
+/**
+ * Model names a split session should show and request, so the status line
+ * and /model reflect the gateway's models. Existing env always wins.
+ */
+export function splitModelEnv(config: ProxyConfig, base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  if (config.mode !== "gateway") return {};
+  const out: NodeJS.ProcessEnv = {};
+  const set = (key: string, value: string | undefined): void => {
+    if (value && !base[key]) out[key] = value;
+  };
+  if (config.forceModel) {
+    set("ANTHROPIC_MODEL", config.forceModel);
+    return out;
+  }
+  set("ANTHROPIC_DEFAULT_OPUS_MODEL", config.tiers.opus);
+  set("ANTHROPIC_DEFAULT_SONNET_MODEL", config.tiers.sonnet);
+  set("ANTHROPIC_DEFAULT_HAIKU_MODEL", config.tiers.haiku);
+  set("ANTHROPIC_MODEL", config.tiers.sonnet);
+  return out;
 }
 
 function freePort(): Promise<number> {
@@ -182,7 +308,7 @@ function waitForPort(port: number, ms: number): Promise<boolean> {
 function findMitmdump(): string | null {
   const bin = process.env.CPR_MITMDUMP || "mitmdump";
   const res = spawnSync(bin, ["--version"], { stdio: "ignore" });
-  return res.error || res.status !== 0 ? null : bin;
+  return res.error ? null : bin;
 }
 
 function claudeBin(): string {
@@ -193,7 +319,9 @@ function forwardExit(child: ChildProcess, cleanup: () => void): Promise<number> 
   return new Promise((resolve) => {
     child.once("error", (err) => {
       cleanup();
-      console.error(`Could not start ${claudeBin()}: ${err.message} (set CPR_CLAUDE_BIN to the claude executable)`);
+      console.error(
+        `Could not start ${claudeBin()}: ${err.message} (set CPR_CLAUDE_BIN to the claude executable)`
+      );
       resolve(1);
     });
     child.once("exit", (code) => {
@@ -203,21 +331,33 @@ function forwardExit(child: ChildProcess, cleanup: () => void): Promise<number> 
   });
 }
 
-export async function runClaude(
-  name: string,
-  claudeArgs: string[],
-  opts: { inference?: string; model?: string; share?: boolean } = {}
-): Promise<number> {
-  const dir = prepareAccountDir(name, { share: opts.share });
+export interface RunOptions {
+  inference?: string;
+  model?: string;
+  share?: boolean;
+  home?: boolean;
+}
+
+export async function runClaude(name: string, claudeArgs: string[], opts: RunOptions = {}): Promise<number> {
+  const settings = readSettings(getProfileFilePath(name));
+  if (!settings) throw new Error(`Provider profile not found: settings.${name}.json`);
+  const oauth = isOauthProfile(settings);
+
+  const dir = opts.home ? null : prepareAccountDir(name, { share: opts.share });
   const env = buildClaudeEnv(name, dir);
+  if (dir && oauth && !hasLogin(dir)) {
+    console.error(`First run of ${name}: type /login in claude and sign in with this account.`);
+  }
 
   if (!opts.inference || opts.inference === name) {
     const child = spawn(claudeBin(), claudeArgs, { stdio: "inherit", env });
     return forwardExit(child, () => undefined);
   }
 
-  if (!isOauthProfile(readSettings(getProfileFilePath(name)))) {
-    throw new Error(`Split mode needs ${name} to be a claude.ai login profile (that's what keeps Remote Control on).`);
+  if (!oauth) {
+    throw new Error(
+      `Split mode needs ${name} to be a claude.ai login profile (that's what keeps Remote Control on).`
+    );
   }
   const config = buildProxyConfig(opts.inference, { model: opts.model });
   const mitmdump = findMitmdump();
@@ -238,11 +378,16 @@ export async function runClaude(
     mitmdump,
     [
       "-q",
-      "--listen-host", "127.0.0.1",
-      "--listen-port", String(port),
-      "--set", `confdir=${confdir}`,
-      "--allow-hosts", "^api\\.anthropic\\.com(:443)?$",
-      "-s", addonFile,
+      "--listen-host",
+      "127.0.0.1",
+      "--listen-port",
+      String(port),
+      "--set",
+      `confdir=${confdir}`,
+      "--allow-hosts",
+      "^api\\.anthropic\\.com(:443)?$",
+      "-s",
+      addonFile,
     ],
     { stdio: "ignore", env: { ...process.env, CPR_PROXY_CONFIG: configFile } }
   );
@@ -252,7 +397,7 @@ export async function runClaude(
     fs.rmSync(work, { recursive: true, force: true });
   };
 
-  const ready = await waitForPort(port, 15_000);
+  const ready = await waitForPort(port, 30_000);
   const ca = path.join(confdir, "mitmproxy-ca-cert.pem");
   if (!ready || !fs.existsSync(ca)) {
     cleanup();
@@ -262,7 +407,13 @@ export async function runClaude(
   const proxyUrl = `http://127.0.0.1:${port}`;
   const child = spawn(claudeBin(), claudeArgs, {
     stdio: "inherit",
-    env: { ...env, HTTPS_PROXY: proxyUrl, https_proxy: proxyUrl, NODE_EXTRA_CA_CERTS: ca },
+    env: {
+      ...env,
+      ...splitModelEnv(config, env),
+      HTTPS_PROXY: proxyUrl,
+      https_proxy: proxyUrl,
+      NODE_EXTRA_CA_CERTS: ca,
+    },
   });
   return forwardExit(child, cleanup);
 }

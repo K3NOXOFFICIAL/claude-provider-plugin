@@ -4,6 +4,13 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { PRESETS, MODEL_ENV_KEYS, DEFAULT_MODEL_HINTS } from "./constants.js";
+import {
+  describeLauncher,
+  installShellIntegration,
+  readLaunchers,
+  removeLauncher,
+  saveLauncher,
+} from "./launchers.js";
 import type { PresetKey } from "./constants.js";
 import type { Settings } from "./types.js";
 import {
@@ -322,6 +329,7 @@ async function runInteractiveMenuWithProfiles(
       })),
       { value: "__add__", label: "✙ Add provider" },
       { value: "__account__", label: "👤 Add another Claude account" },
+      { value: "__launchers__", label: "🚀 Start commands (claude <name>)" },
       { value: "__manage__", label: "⚙ Manage providers" },
       { value: "__exit__", label: "Exit" },
     ],
@@ -340,6 +348,11 @@ async function runInteractiveMenuWithProfiles(
 
   if (choice === "__manage__") {
     await manageProvidersMenu(profiles, active);
+    return;
+  }
+
+  if (choice === "__launchers__") {
+    await launchersMenu(profiles.map((pr) => pr.name));
     return;
   }
 
@@ -374,6 +387,113 @@ async function runInteractiveMenuWithProfiles(
     p.outro(`${chalk.red("Failed:")} ${message}`);
     process.exitCode = 1;
   }
+}
+
+/**
+ * Create, change and remove start commands (launchers).
+ */
+async function launchersMenu(profileNames: string[]): Promise<void> {
+  const all = readLaunchers();
+  const pick = await p.select({
+    message: "Start commands",
+    options: [
+      ...Object.entries(all).map(([name, l]) => ({
+        value: name,
+        label: `claude ${name}`,
+        hint: describeLauncher(l),
+      })),
+      { value: "__new__", label: "✙ New start command" },
+      { value: "__shell__", label: "Enable `claude <name>` in my shell" },
+      { value: "__back__", label: "← Back" },
+    ],
+  });
+  if (p.isCancel(pick) || pick === "__back__") return runInteractiveMenu();
+
+  if (pick === "__shell__") {
+    try {
+      for (const { file, result } of installShellIntegration()) p.log.success(`${result}: ${file}`);
+      p.log.info("Open a new terminal, then: claude <name>");
+    } catch (e) {
+      p.log.error(e instanceof Error ? e.message : String(e));
+    }
+    return launchersMenu(profileNames);
+  }
+
+  if (pick !== "__new__") {
+    const action = await p.select({
+      message: `claude ${pick}`,
+      options: [
+        { value: "change", label: "Change" },
+        { value: "remove", label: "Remove" },
+        { value: "__back__", label: "← Back" },
+      ],
+    });
+    if (p.isCancel(action) || action === "__back__") return launchersMenu(profileNames);
+    if (action === "remove") {
+      removeLauncher(String(pick));
+      p.log.success(`Removed claude ${pick}`);
+      return launchersMenu(profileNames);
+    }
+  }
+
+  const existing = pick === "__new__" ? undefined : all[String(pick)];
+  let name = existing ? String(pick) : "";
+  if (!existing) {
+    const input = await p.text({
+      message: "Command name (you will type: claude <name>)",
+      placeholder: "keno",
+      validate: (v) => {
+        if (!v) return "Name required";
+        if (!isValidProviderName(v)) return "Use letters, numbers, _ or -";
+        if (all[v]) return "Already exists";
+        return undefined;
+      },
+    });
+    if (p.isCancel(input)) return launchersMenu(profileNames);
+    name = input;
+  }
+
+  const profile = await p.select({
+    message: "Profile to start (its login/provider)",
+    initialValue: existing?.profile,
+    options: profileNames.map((n) => ({ value: n, label: n })),
+  });
+  if (p.isCancel(profile)) return launchersMenu(profileNames);
+
+  const home = await p.confirm({
+    message: "Use the normal ~/.claude login and data? (No = own config dir, e.g. for a second account)",
+    initialValue: existing?.home ?? false,
+  });
+  if (p.isCancel(home)) return launchersMenu(profileNames);
+
+  const inference = await p.select({
+    message: "Send model requests through another profile? (keeps Remote Control on this login)",
+    initialValue: existing?.inference ?? "__none__",
+    options: [
+      { value: "__none__", label: "No" },
+      ...profileNames.filter((n) => n !== profile).map((n) => ({ value: n, label: n })),
+    ],
+  });
+  if (p.isCancel(inference)) return launchersMenu(profileNames);
+
+  try {
+    const { shim, shimConflict } = saveLauncher(
+      name,
+      {
+        ...existing,
+        profile,
+        home: home || undefined,
+        inference: inference === "__none__" ? undefined : inference,
+      },
+      { create: !existing }
+    );
+    p.log.success(`claude ${name}: ${describeLauncher(readLaunchers()[name])}`);
+    p.log.info(`Also available as "cpr launch ${name}"${shim ? ` and ${path.basename(shim)}` : ""}.`);
+    if (shimConflict) p.log.warn(`${shimConflict} already exists and is not ours; left untouched.`);
+  } catch (e) {
+    p.log.error(e instanceof Error ? e.message : String(e));
+  }
+  return launchersMenu(profileNames);
 }
 
 /**
