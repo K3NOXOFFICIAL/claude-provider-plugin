@@ -1,14 +1,25 @@
 import { Command } from "commander";
 import chalk from "chalk";
-import { listProfiles, detectActiveProfile, switchToProvider } from "./profiles.js";
+import {
+  listProfiles,
+  detectActiveProfile,
+  switchProfile,
+  duplicateProfile,
+  addClaudeAccount,
+} from "./profiles.js";
 import { runInteractiveMenu } from "./interactive.js";
 import { mcpServer } from "./mcp.js";
 import {
-  isMacOS,
   saveCredentialForProfile,
   restoreCredentialForProfile,
   listSavedCredentials,
+  clearLogin,
 } from "./credentials.js";
+
+function fail(message: string): never {
+  console.error(chalk.red(message));
+  process.exit(1);
+}
 
 /**
  * Display list of installed providers
@@ -24,10 +35,12 @@ function showProviderList(): void {
   }
 
   const active = detectActiveProfile(profiles);
+  const saved = new Set(listSavedCredentials());
 
   for (const profile of profiles) {
     const marker = profile.name === active ? chalk.green(" (active)") : "";
-    console.log(` - ${profile.name}${marker}`);
+    const login = saved.has(profile.name) ? chalk.dim(" [login saved]") : "";
+    console.log(` - ${profile.name}${marker}${login}`);
   }
 }
 
@@ -35,89 +48,50 @@ function showProviderList(): void {
  * Direct switch to a provider by name
  */
 function directSwitch(name: string): void {
-  const profiles = listProfiles();
-  const exists = profiles.some((p) => p.name.toLowerCase() === name.toLowerCase());
+  const profile = listProfiles().find((p) => p.name.toLowerCase() === name.toLowerCase());
 
-  if (!exists) {
+  if (!profile) {
     console.error(chalk.red(`Provider not installed: ${name}`));
     console.error(chalk.dim('Tip: run "claude-provider" or "cpr" to add providers interactively.'));
     process.exit(1);
   }
 
-  // Find exact case-insensitive match
-  const profile = profiles.find((p) => p.name.toLowerCase() === name.toLowerCase());
-  if (!profile) {
-    console.error(chalk.red(`Provider not found: ${name}`));
-    process.exit(1);
-  }
-
-  switchToProvider(profile.name);
+  const { notes } = switchProfile(profile.name);
   console.log(`✅ Switched to ${chalk.cyan(profile.name)}. Run "claude" then /status.`);
-
-  // Opt-in: automatically swap the keychain OAuth credential to match the
-  // newly activated profile. Enables seamless switching between profiles
-  // that share an ANTHROPIC_BASE_URL (e.g. multiple Anthropic plans).
-  if (isMacOS() && isCredentialAutoSwapEnabled()) {
-    const result = restoreCredentialForProfile(profile.name);
-    if (result.restored) {
-      console.log(chalk.dim(`   (keychain credential restored from ${result.path})`));
-    } else if (result.reason && result.reason !== "no saved credential for profile") {
-      console.warn(chalk.yellow(`   (credential restore skipped: ${result.reason})`));
-    }
-  }
-}
-
-function isCredentialAutoSwapEnabled(): boolean {
-  const value = process.env.CPR_SWAP_CREDENTIALS;
-  if (!value) return false;
-  return !["0", "false", "no", "off"].includes(value.toLowerCase());
+  for (const note of notes) console.log(chalk.dim(`   (${note})`));
 }
 
 /**
  * Handle `cpr credential <action> [profile]` subcommand.
  */
 function handleCredentialCommand(action: string, profile?: string): void {
-  if (!isMacOS()) {
-    console.error(chalk.red("credential commands are only supported on macOS"));
-    process.exit(1);
-  }
-
   switch (action) {
     case "save": {
-      if (!profile) {
-        console.error(chalk.red("Usage: cpr credential save <profile>"));
-        process.exit(1);
-      }
+      if (!profile) fail("Usage: cpr credential save <profile>");
       const result = saveCredentialForProfile(profile);
-      if (result.saved) {
-        console.log(`✅ Saved credential for ${chalk.cyan(profile)} → ${result.path}`);
-      } else {
-        console.error(chalk.red(`Failed: ${result.reason}`));
-        process.exit(1);
-      }
+      if (!result.saved) fail(`Failed: ${result.reason}`);
+      console.log(`✅ Saved login for ${chalk.cyan(profile)} → ${result.path}`);
       return;
     }
     case "restore": {
-      if (!profile) {
-        console.error(chalk.red("Usage: cpr credential restore <profile>"));
-        process.exit(1);
-      }
+      if (!profile) fail("Usage: cpr credential restore <profile>");
       const result = restoreCredentialForProfile(profile);
-      if (result.restored) {
-        console.log(`✅ Restored credential for ${chalk.cyan(profile)} from ${result.path}`);
-      } else {
-        console.error(chalk.red(`Failed: ${result.reason}`));
-        process.exit(1);
-      }
+      if (!result.restored) fail(`Failed: ${result.reason}`);
+      console.log(`✅ Restored login for ${chalk.cyan(profile)} from ${result.path}`);
+      return;
+    }
+    case "clear": {
+      clearLogin();
+      console.log("✅ Logged out locally. Run claude, then /login.");
       return;
     }
     case "list": {
       const saved = listSavedCredentials();
       if (saved.length === 0) {
-        console.log(chalk.dim("No saved credentials. Run `cpr credential save <profile>`."));
+        console.log(chalk.dim("No saved logins. Run `cpr credential save <profile>`."));
         return;
       }
-      console.log(chalk.bold("Saved credentials:"));
+      console.log(chalk.bold("Saved logins:"));
       for (const name of saved) {
         console.log(` - ${name}`);
       }
@@ -125,7 +99,7 @@ function handleCredentialCommand(action: string, profile?: string): void {
     }
     default:
       console.error(chalk.red(`Unknown action: ${action}`));
-      console.error(chalk.dim("Available: save, restore, list"));
+      console.error(chalk.dim("Available: save, restore, clear, list"));
       process.exit(1);
   }
 }
@@ -136,15 +110,16 @@ function handleCredentialCommand(action: string, profile?: string): void {
 export function createProgram(): Command {
   return new Command()
     .name("claude-provider")
-    .description("CLI tool to switch between Claude Code API providers")
-    .version("0.0.6")
+    .description("CLI tool to switch between Claude Code API providers and Claude accounts")
+    .version("0.1.0")
     .argument(
       "[provider]",
-      'provider name (e.g. kimi, zai, qwen, minimax, deepseek) or "credential" for keychain subcommand'
+      "provider name to switch to, or: mcp | credential | duplicate | add-account"
     )
-    .argument("[action]", 'subcommand action (for "credential" only: save / restore / list)')
-    .argument("[profile]", 'profile name (required for "credential save|restore")')
-    .option("-l, --list", "list installed providers");
+    .argument("[arg1]", "credential: save|restore|clear|list; duplicate: source; add-account: name")
+    .argument("[arg2]", "credential: profile; duplicate: new name")
+    .option("-l, --list", "list installed providers")
+    .option("--with-credentials", "duplicate: also copy the saved Claude login");
 }
 
 /**
@@ -154,8 +129,8 @@ export async function runCli(): Promise<void> {
   const program = createProgram();
   program.parse(process.argv);
 
-  const opts = program.opts<{ list?: boolean }>();
-  const provider = program.args[0];
+  const opts = program.opts<{ list?: boolean; withCredentials?: boolean }>();
+  const [provider, arg1, arg2] = program.args;
 
   if (opts.list) {
     showProviderList();
@@ -167,13 +142,29 @@ export async function runCli(): Promise<void> {
   }
 
   if (provider === "credential") {
-    const action = program.args[1];
-    const credProfile = program.args[2];
-    if (!action) {
-      console.error(chalk.red("Usage: cpr credential <save|restore|list> [profile]"));
-      process.exit(1);
+    if (!arg1) fail("Usage: cpr credential <save|restore|clear|list> [profile]");
+    handleCredentialCommand(arg1, arg2);
+    return;
+  }
+
+  if (provider === "duplicate") {
+    if (!arg1 || !arg2) fail("Usage: cpr duplicate <source> <new-name> [--with-credentials]");
+    try {
+      const file = duplicateProfile(arg1, arg2, { withCredentials: opts.withCredentials });
+      console.log(`✅ Duplicated ${chalk.cyan(arg1)} → ${chalk.cyan(arg2)} (${file})`);
+    } catch (e) {
+      fail(e instanceof Error ? e.message : String(e));
     }
-    handleCredentialCommand(action, credProfile);
+    return;
+  }
+
+  if (provider === "add-account") {
+    if (!arg1) fail("Usage: cpr add-account <name>");
+    try {
+      for (const note of addClaudeAccount(arg1)) console.log(`✅ ${note}`);
+    } catch (e) {
+      fail(e instanceof Error ? e.message : String(e));
+    }
     return;
   }
 

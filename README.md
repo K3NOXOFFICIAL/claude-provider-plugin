@@ -131,25 +131,41 @@ cpr -l
 
 Display all installed providers with the active one highlighted.
 
-### Keychain Credential Swap (macOS, opt-in)
-
-When multiple profiles target the same Anthropic account (e.g. a Pro plan and a Team plan on one login), settings.json alone isn't enough to switch — Claude Code authenticates via an OAuth blob in the macOS keychain. The `credential` subcommand snapshots that blob per profile so `switch` can restore the correct one.
+### Duplicate a Profile
 
 ```bash
-# Snapshot the current keychain credential for the active profile
-cpr credential save anthropic
-
-# Restore a previously saved credential to the keychain
-cpr credential restore anthropic
-
-# List saved credentials
-cpr credential list
-
-# Auto-restore on switch (opt-in via env var)
-CPR_SWAP_CREDENTIALS=1 cpr switch anthropic-team
+cpr duplicate kimi kimi-work
+cpr duplicate anthropic-main anthropic-copy --with-credentials   # also copy the saved Claude login
 ```
 
-macOS only. Without `CPR_SWAP_CREDENTIALS` the `switch` command never touches the keychain, so existing users are unaffected.
+Also available in the interactive menu (Manage providers → Duplicate), as the MCP tool `duplicate_profile`, and as `/provider:duplicate`.
+
+### Multiple Claude Subscriptions
+
+Profiles without an API key use your Claude subscription login. That login is swapped automatically on every switch:
+
+- Windows / Linux: `~/.claude/.credentials.json`
+- macOS: keychain item `Claude Code-credentials`
+- plus the `oauthAccount` block of `~/.claude.json`, so `/status` shows the right account
+
+Saved logins live in `~/.claude/credentials.<profile>.json` (mode 0600, plaintext on Windows/Linux like Claude Code's own file).
+
+```bash
+# 1. you are logged in as account A with profile "anthropic-main" active
+# 2. add account B:
+cpr add-account anthropic-secondary   # saves A's login, logs out locally
+claude                                # then /login with account B
+
+# switch whenever you like — logins are saved and restored for you
+cpr anthropic-main
+cpr anthropic-secondary
+```
+
+Other helpers: `cpr credential save|restore|clear|list [profile]`. Disable auto-swapping with `CPR_SWAP_CREDENTIALS=0`. Restart Claude Code after switching accounts.
+
+### Custom `/v1` Gateways
+
+Custom profiles accept a base URL with or without a trailing `/v1` (Claude Code appends `/v1/messages` itself, so `/v1` is stripped), and can fetch the model list from `<base>/v1/models`. The endpoint must speak the **Anthropic Messages API**; pure OpenAI `/chat/completions` endpoints need a translating gateway in front.
 
 ---
 

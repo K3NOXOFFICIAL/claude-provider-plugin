@@ -1,10 +1,18 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Profile, Settings } from "./types.js";
+import { MODEL_ENV_KEYS, PRESETS } from "./constants.js";
 import {
-  MODEL_ENV_KEYS,
-} from "./constants.js";
+  clearLogin,
+  copySavedCredential,
+  deleteSavedCredential,
+  hasSavedCredential,
+  readLiveCredential,
+  restoreCredentialForProfile,
+  saveCredentialForProfile,
+} from "./credentials.js";
 import {
+  isValidProviderName,
   createApiKeyHelper,
   ensureClaudeDir,
   getClaudeDir,
@@ -326,6 +334,7 @@ export function deleteProfile(name: string): void {
     throw new Error(`Provider profile not found: settings.${name}.json`);
   }
   fs.unlinkSync(file);
+  deleteSavedCredential(name);
 
   // Clear the active-profile marker if it pointed to the deleted profile.
   if (readActiveProfileMarker() === name) {
@@ -342,4 +351,120 @@ export function deleteProfile(name: string): void {
  */
 export function getProfileFilePath(name: string): string {
   return getProfilePath(name);
+}
+
+/**
+ * A profile uses the Claude subscription login (OAuth) when it carries no API key.
+ */
+export function isOauthProfile(settings: Settings | null): boolean {
+  if (!settings) return false;
+  return (
+    !settings.apiKeyHelper && !settings.env?.ANTHROPIC_AUTH_TOKEN && !settings.env?.ANTHROPIC_API_KEY
+  );
+}
+
+function isCredentialSwapEnabled(): boolean {
+  const value = process.env.CPR_SWAP_CREDENTIALS;
+  if (!value) return true;
+  return !["0", "false", "no", "off"].includes(value.toLowerCase());
+}
+
+/**
+ * Switch profiles and swap the Claude login with it: the outgoing OAuth
+ * profile's login is saved, the incoming one's is restored. Opt out with
+ * CPR_SWAP_CREDENTIALS=0. Returns human-readable notes.
+ */
+export function switchProfile(name: string): { path: string; notes: string[] } {
+  const notes: string[] = [];
+  const swap = isCredentialSwapEnabled();
+  const outgoing = swap ? detectActiveProfile(listProfiles()) : null;
+
+  if (swap && outgoing && outgoing !== name) {
+    const outSettings = readSettings(getProfilePath(outgoing));
+    if (isOauthProfile(outSettings) && readLiveCredential()) {
+      const res = saveCredentialForProfile(outgoing);
+      if (res.saved) notes.push(`saved Claude login for ${outgoing}`);
+    }
+  }
+
+  const dest = switchToProvider(name);
+
+  if (swap && isOauthProfile(readSettings(getProfilePath(name)))) {
+    if (hasSavedCredential(name)) {
+      const res = restoreCredentialForProfile(name);
+      if (res.restored) notes.push(`restored Claude login for ${name}`);
+      else notes.push(`login restore skipped: ${res.reason}`);
+    } else {
+      notes.push(
+        `no saved Claude login for ${name}; run claude and /login once (it is saved when you switch away)`
+      );
+    }
+  }
+
+  return { path: dest, notes };
+}
+
+/**
+ * Copy an existing profile under a new name. Saved logins are not copied
+ * unless requested, so the copy can be logged in to a different account.
+ */
+export function duplicateProfile(
+  src: string,
+  dest: string,
+  opts: { withCredentials?: boolean } = {}
+): string {
+  if (!isValidProviderName(dest)) {
+    throw new Error("Use letters, numbers, _ or - for the profile name");
+  }
+  const from = getProfilePath(src);
+  if (!fs.existsSync(from)) {
+    throw new Error(`Provider profile not found: settings.${src}.json`);
+  }
+  if (profileExists(dest)) {
+    throw new Error(`Provider profile already exists: settings.${dest}.json`);
+  }
+  const to = getProfilePath(dest);
+  fs.copyFileSync(from, to);
+  try {
+    fs.chmodSync(to, 0o600);
+  } catch {
+    // chmod may fail on Windows
+  }
+  if (opts.withCredentials) copySavedCredential(src, dest);
+  return to;
+}
+
+/**
+ * Prepare an additional Claude subscription account: creates an OAuth profile,
+ * saves the current login to the active profile, then logs out locally so
+ * `/login` in claude signs in the new account.
+ */
+export function addClaudeAccount(name: string): string[] {
+  if (!isValidProviderName(name)) {
+    throw new Error("Use letters, numbers, _ or - for the profile name");
+  }
+  if (profileExists(name)) {
+    throw new Error(`Provider profile already exists: settings.${name}.json`);
+  }
+
+  const notes: string[] = [];
+  if (readLiveCredential()) {
+    const active = detectActiveProfile(listProfiles());
+    if (!active || !isOauthProfile(readSettings(getProfilePath(active)))) {
+      throw new Error(
+        "A Claude login exists but no OAuth profile is active to hold it. " +
+          "Save it first: cpr credential save <profile> (after creating that profile)."
+      );
+    }
+    const res = saveCredentialForProfile(active);
+    if (!res.saved) throw new Error(`Could not save current login: ${res.reason}`);
+    notes.push(`saved current Claude login for ${active}`);
+  }
+
+  writeProfile(name, { env: { ...PRESETS.anthropic.env }, model: PRESETS.anthropic.model });
+  switchToProvider(name);
+  clearLogin();
+  notes.push(`created profile ${name} and logged out locally`);
+  notes.push("next: run claude, then /login with the second account");
+  return notes;
 }

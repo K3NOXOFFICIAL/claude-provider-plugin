@@ -6,11 +6,20 @@ import os from "node:os";
 import { PRESETS, MODEL_ENV_KEYS, DEFAULT_MODEL_HINTS } from "./constants.js";
 import type { PresetKey } from "./constants.js";
 import type { Settings } from "./types.js";
-import { createApiKeyHelper, isValidProviderName, getSettingsPath, readSettings } from "./utils.js";
+import {
+  createApiKeyHelper,
+  isValidProviderName,
+  getSettingsPath,
+  readSettings,
+  normalizeBaseUrl,
+  fetchModels,
+} from "./utils.js";
 import {
   listProfiles,
   detectActiveProfile,
-  switchToProvider,
+  switchProfile,
+  duplicateProfile,
+  addClaudeAccount,
   writeProfile,
   getActiveProviderDisplay,
   deleteProfile,
@@ -91,7 +100,7 @@ export async function addProviderInteractive(): Promise<string | null> {
   if (p.isCancel(makeActive)) return null;
 
   if (makeActive) {
-    switchToProvider(providerName);
+    switchProfile(providerName);
     p.note(`Active provider is now: ${chalk.cyan(providerName)}`, "Switched");
   }
 
@@ -138,11 +147,18 @@ async function buildPresetSettings(presetKey: PresetKey): Promise<Settings | nul
 
 async function buildCustomSettings(): Promise<Settings | null> {
   const baseUrl = await p.text({
-    message: "ANTHROPIC_BASE_URL",
-    placeholder: "https://example.com/anthropic",
+    message: "ANTHROPIC_BASE_URL (Anthropic-compatible endpoint; a trailing /v1 is fine)",
+    placeholder: "https://example.com/v1",
     validate: (v) => (!v ? "Base URL required" : undefined),
   });
   if (p.isCancel(baseUrl)) return null;
+
+  const normalized = normalizeBaseUrl(baseUrl);
+  if (normalized.stripped) {
+    p.log.info(
+      `Using ${chalk.cyan(normalized.url)} (Claude Code adds /v1/messages itself, so the trailing /v1 was removed).`
+    );
+  }
 
   const token = await p.password({
     message: "API key / token",
@@ -151,14 +167,41 @@ async function buildCustomSettings(): Promise<Settings | null> {
   });
   if (p.isCancel(token)) return null;
 
-  const model = await p.text({
-    message: "Default model id (optional)",
-    placeholder: "qwen-plus / glm-4.6 / deepseek-chat ...",
+  let model: string | symbol = "";
+  const wantFetch = await p.confirm({
+    message: "Fetch the model list from <base>/v1/models?",
+    initialValue: true,
   });
-  if (p.isCancel(model)) return null;
+  if (p.isCancel(wantFetch)) return null;
+
+  if (wantFetch) {
+    try {
+      const ids = await fetchModels(normalized.url, token);
+      if (ids.length > 0) {
+        const picked = await p.select({
+          message: "Default model",
+          options: ids.slice(0, 50).map((id) => ({ value: id, label: id })),
+        });
+        if (p.isCancel(picked)) return null;
+        model = picked;
+      } else {
+        p.log.warn("Endpoint returned no models.");
+      }
+    } catch (e) {
+      p.log.warn(`Could not fetch models: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  if (!model) {
+    model = await p.text({
+      message: "Default model id (optional)",
+      placeholder: "qwen-plus / glm-4.6 / deepseek-chat ...",
+    });
+    if (p.isCancel(model)) return null;
+  }
 
   const env: Record<string, string> = {
-    ANTHROPIC_BASE_URL: baseUrl.trim(),
+    ANTHROPIC_BASE_URL: normalized.url,
   };
 
   let modelName: string | undefined;
@@ -278,6 +321,7 @@ async function runInteractiveMenuWithProfiles(
         hint: pr.name === active ? "active" : undefined,
       })),
       { value: "__add__", label: "✙ Add provider" },
+      { value: "__account__", label: "👤 Add another Claude account" },
       { value: "__manage__", label: "⚙ Manage providers" },
       { value: "__exit__", label: "Exit" },
     ],
@@ -299,8 +343,31 @@ async function runInteractiveMenuWithProfiles(
     return;
   }
 
+  if (choice === "__account__") {
+    const name = await p.text({
+      message: "Name for the new Claude account profile",
+      placeholder: "anthropic-secondary",
+      validate: (v) => {
+        if (!v) return "Name required";
+        if (!isValidProviderName(v)) return "Use letters, numbers, _ or -";
+        if (profiles.some((pr) => pr.name.toLowerCase() === v.toLowerCase())) return "Already exists";
+        return undefined;
+      },
+    });
+    if (p.isCancel(name)) return;
+    try {
+      for (const note of addClaudeAccount(name)) p.log.info(note);
+      p.outro("Done.");
+    } catch (e) {
+      p.outro(`${chalk.red("Failed:")} ${e instanceof Error ? e.message : String(e)}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   try {
-    switchToProvider(String(choice));
+    const { notes } = switchProfile(String(choice));
+    for (const note of notes) p.log.info(note);
     p.outro(`✅ Switched to ${chalk.cyan(choice)}. Run ${chalk.bold("claude")} then /status.`);
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
@@ -345,6 +412,7 @@ async function manageProvidersMenu(
     message: `What do you want to do with "${providerName}"?`,
     options: [
       { value: "edit", label: "Edit provider" },
+      { value: "duplicate", label: "Duplicate" },
       { value: "delete", label: "Delete" },
       { value: "__back__", label: "← Back" },
     ],
@@ -352,6 +420,29 @@ async function manageProvidersMenu(
 
   if (p.isCancel(action) || action === "__back__") {
     return manageProvidersMenu(profiles, active);
+  }
+
+  if (action === "duplicate") {
+    const newName = await p.text({
+      message: `Name for the copy of "${providerName}"`,
+      initialValue: `${providerName}-copy`,
+      validate: (v) => {
+        if (!v) return "Name required";
+        if (!isValidProviderName(v)) return "Use letters, numbers, _ or -";
+        if (profiles.some((pr) => pr.name.toLowerCase() === v.toLowerCase())) return "Already exists";
+        return undefined;
+      },
+    });
+    if (!p.isCancel(newName)) {
+      try {
+        const file = duplicateProfile(providerName, newName);
+        p.note(`${chalk.green("Created")} ${path.basename(file)}`, "Profile duplicated");
+      } catch (e) {
+        p.log.error(e instanceof Error ? e.message : String(e));
+      }
+    }
+    const updated = listProfiles();
+    return manageProvidersMenu(updated, detectActiveProfile(updated));
   }
 
   if (action === "edit") {
