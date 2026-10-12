@@ -129,7 +129,7 @@ export function removeLauncher(name: string): void {
 
 export function describeLauncher(l: Launcher): string {
   const parts = [l.profile];
-  parts.push(l.home ? "(~/.claude login)" : "(own config dir)");
+  parts.push(l.home ? "(shared ~/.claude)" : "(own config dir)");
   if (!l.home && (l.sessions === false || l.share === false)) parts.push("own sessions");
   if (l.inference) parts.push(`→ inference via ${l.inference}`);
   if (l.model) parts.push(`model ${l.model}`);

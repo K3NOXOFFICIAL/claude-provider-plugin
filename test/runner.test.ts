@@ -17,6 +17,7 @@ import {
   splitModelEnv,
   SESSION_ENTRIES,
   claudeBin,
+  activateHomeLogin,
 } from "../src/runner.js";
 import { PROXY_ADDON_PY } from "../src/proxy-addon.js";
 
@@ -362,5 +363,88 @@ describe("claudeBin", () => {
     expect(claudeBin({ CPR_CLAUDE_BIN: "x", PATH: onPath })).toBe("x");
     expect(claudeBin({ PATH: onPath })).toBe(path.join(onPath, exe));
     expect(claudeBin({ PATH: "" })).toBe("claude");
+  });
+});
+
+describe("activateHomeLogin (one ~/.claude, swapped login)", () => {
+  const cred = (token: string, exp: number): string =>
+    JSON.stringify({ claudeAiOauth: { accessToken: token, refreshToken: `r-${token}`, expiresAt: exp } });
+  const live = (): string => fs.readFileSync(path.join(home, ".claude", ".credentials.json"), "utf8");
+  const email = (): string => JSON.parse(fs.readFileSync(path.join(home, ".claude.json"), "utf8")).oauthAccount.emailAddress;
+  const setLive = (token: string, exp: number, account: string): void => {
+    fs.writeFileSync(path.join(home, ".claude", ".credentials.json"), cred(token, exp));
+    const json = JSON.parse(fs.readFileSync(path.join(home, ".claude.json"), "utf8"));
+    json.oauthAccount = { accountUuid: account, emailAddress: `${account}@x` };
+    fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify(json));
+  };
+
+  beforeEach(() => {
+    fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".claude.json"), JSON.stringify({ projects: { "C:/p": {} } }));
+    writeProfile("acc-k", { env: {} });
+    writeProfile("acc-n", { env: {} });
+    writeProfile("gw", { env: { ANTHROPIC_BASE_URL: "https://gw", ANTHROPIC_AUTH_TOKEN: "t" } });
+  });
+
+  it("swaps logins both ways and keeps each account's refreshed token", () => {
+    setLive("k1", 100, "keno");
+    fs.writeFileSync(path.join(home, ".claude", ".active-profile"), "acc-k\n");
+    // nils was logged in once in its isolated dir; a stale snapshot of keno sits under its name.
+    const nilsDir = getAccountDir("acc-n");
+    fs.mkdirSync(nilsDir, { recursive: true });
+    fs.writeFileSync(path.join(nilsDir, ".credentials.json"), cred("n1", 200));
+    fs.writeFileSync(path.join(nilsDir, ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: "nils", emailAddress: "nils@x" } }));
+    fs.writeFileSync(
+      path.join(home, ".claude", "credentials.acc-n.json"),
+      JSON.stringify({ version: 1, credential: cred("k0", 50), oauthAccount: { accountUuid: "keno" } })
+    );
+
+    activateHomeLogin("acc-n");
+    expect(JSON.parse(live()).claudeAiOauth.accessToken).toBe("n1");
+    expect(email()).toBe("nils@x");
+
+    setLive("n2", 300, "nils"); // claude refreshed nils's token while running
+    activateHomeLogin("acc-k");
+    expect(JSON.parse(live()).claudeAiOauth.accessToken).toBe("k1");
+    expect(email()).toBe("keno@x");
+
+    setLive("k2", 400, "keno");
+    activateHomeLogin("acc-n");
+    expect(JSON.parse(live()).claudeAiOauth.accessToken).toBe("n2");
+    activateHomeLogin("acc-k");
+    expect(JSON.parse(live()).claudeAiOauth.accessToken).toBe("k2");
+    // Everything but the login is untouched.
+    expect(JSON.parse(fs.readFileSync(path.join(home, ".claude.json"), "utf8")).projects).toEqual({ "C:/p": {} });
+    expect(fs.readFileSync(path.join(home, ".claude", ".active-profile"), "utf8").trim()).toBe("acc-k");
+  });
+
+  it("logs out locally for a profile with no login, keeping an unowned login as a backup", () => {
+    setLive("x1", 100, "stranger");
+    const notes = activateHomeLogin("acc-n");
+    expect(fs.existsSync(path.join(home, ".claude", ".credentials.json"))).toBe(false);
+    expect(fs.readFileSync(path.join(home, ".claude", ".credentials.json.bak-cpr"), "utf8")).toBe(cred("x1", 100));
+    expect(notes.join("\n")).toMatch(/\/login/);
+  });
+
+  it("runClaude --home swaps for login profiles but not for split launchers", async () => {
+    setLive("k1", 100, "keno");
+    fs.writeFileSync(
+      path.join(home, ".claude", "credentials.acc-n.json"),
+      JSON.stringify({ version: 1, credential: cred("n1", 200), oauthAccount: { accountUuid: "nils" } })
+    );
+    fs.writeFileSync(
+      path.join(home, ".claude", "credentials.acc-k.json"),
+      JSON.stringify({ version: 1, credential: cred("k1", 100), oauthAccount: { accountUuid: "keno" } })
+    );
+    const prev = process.env.CPR_CLAUDE_BIN;
+    process.env.CPR_CLAUDE_BIN = process.execPath;
+    try {
+      await runClaude("acc-n", ["-e", "0"], { home: true });
+      expect(JSON.parse(live()).claudeAiOauth.accessToken).toBe("n1");
+      await expect(runClaude("acc-k", ["-e", "0"], { home: true, inference: "gw" })).rejects.toThrow();
+      expect(JSON.parse(live()).claudeAiOauth.accessToken).toBe("n1");
+    } finally {
+      process.env.CPR_CLAUDE_BIN = prev;
+    }
   });
 });

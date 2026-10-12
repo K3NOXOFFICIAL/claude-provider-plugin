@@ -13,7 +13,23 @@ import {
   writeSettings,
   normalizeBaseUrl,
 } from "./utils.js";
-import { getProfileFilePath, isOauthProfile, mergeProfileSettings } from "./profiles.js";
+import {
+  getProfileFilePath,
+  isOauthProfile,
+  listProfiles,
+  profileExists,
+  mergeProfileSettings,
+  readActiveProfileMarker,
+  writeActiveProfileMarker,
+} from "./profiles.js";
+import {
+  clearLogin,
+  getCredentialPath,
+  readLiveCredential,
+  readOauthAccount,
+  readSavedLogin,
+  restoreCredentialForProfile,
+} from "./credentials.js";
 import { PROXY_ADDON_PY } from "./proxy-addon.js";
 
 /**
@@ -220,6 +236,146 @@ export function hasLogin(dir: string): boolean {
   }
 }
 
+interface Login {
+  credential: string;
+  oauthAccount: unknown | null;
+}
+
+function accountId(account: unknown): string | null {
+  const a = account as { accountUuid?: string; emailAddress?: string } | null;
+  return a?.accountUuid ?? a?.emailAddress ?? null;
+}
+
+function accountEmail(account: unknown): string {
+  return (account as { emailAddress?: string } | null)?.emailAddress ?? "unknown account";
+}
+
+function expiresAt(credential: string | null | undefined): number {
+  try {
+    return Number(JSON.parse(credential ?? "").claudeAiOauth?.expiresAt) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** The login an isolated account dir holds (made by /login there), if any. */
+function readAccountDirLogin(name: string): Login | null {
+  if (process.platform === "darwin") return null;
+  const dir = getAccountDir(name);
+  try {
+    const credential = fs.readFileSync(path.join(dir, ".credentials.json"), "utf8").trim();
+    if (!JSON.parse(credential)?.claudeAiOauth?.accessToken) return null;
+    const json = JSON.parse(fs.readFileSync(path.join(dir, ".claude.json"), "utf8"));
+    return { credential, oauthAccount: json.oauthAccount ?? null };
+  } catch {
+    return null;
+  }
+}
+
+function writeSavedLogin(name: string, login: Login): void {
+  const file = getCredentialPath(name);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ version: 1, ...login }) + "\n", { mode: 0o600 });
+}
+
+/**
+ * The login a profile should use. An isolated account dir was logged in with
+ * /login under that name, so it wins over a snapshot of another account and
+ * over an older token of the same one.
+ */
+export function loginFor(name: string): Login | null {
+  const saved = readSavedLogin(name);
+  const own = readAccountDirLogin(name);
+  if (
+    own &&
+    (!saved ||
+      accountId(own.oauthAccount) !== accountId(saved.oauthAccount) ||
+      expiresAt(own.credential) > expiresAt(saved.credential))
+  ) {
+    writeSavedLogin(name, own);
+    return own;
+  }
+  return saved;
+}
+
+/** Live claude processes on ~/.claude other than our own. */
+function liveHomeSessions(): number {
+  const dir = path.join(getClaudeDir(), "sessions");
+  let count = 0;
+  try {
+    for (const f of fs.readdirSync(dir).filter((f) => /^\d+\.json$/.test(f))) {
+      const pid = Number(f.slice(0, -5));
+      try {
+        process.kill(pid, 0);
+        count++;
+      } catch {
+        // Not running.
+      }
+    }
+  } catch {
+    // No sessions dir.
+  }
+  return count;
+}
+
+/**
+ * Make `name`'s claude.ai login the live one in ~/.claude, keeping every other
+ * file (settings, memory, sessions) as it is. The outgoing login is saved
+ * first under the profile it belongs to, found by account, not by name.
+ */
+export function activateHomeLogin(name: string): string[] {
+  const notes: string[] = [];
+  const target = loginFor(name);
+  const live = readLiveCredential();
+  const liveAccount = readOauthAccount();
+  const liveId = accountId(liveAccount);
+
+  if (live && liveId && target && accountId(target.oauthAccount) === liveId) {
+    if (expiresAt(live) >= expiresAt(target.credential)) writeSavedLogin(name, { credential: live, oauthAccount: liveAccount });
+    else restoreCredentialForProfile(name);
+    writeActiveProfileMarker(name);
+    return notes;
+  }
+
+  if (live) {
+    const owners = listProfiles()
+      .map((p) => p.name)
+      .filter((p) => p !== name && isOauthProfile(readSettings(getProfileFilePath(p))))
+      .filter((p) => liveId && accountId(loginFor(p)?.oauthAccount) === liveId);
+    // Not saved anywhere yet: it belongs to the profile last activated, if that one has no login.
+    const marked = readActiveProfileMarker();
+    if (owners.length === 0 && marked && marked !== name && profileExists(marked) && !loginFor(marked)) {
+      if (isOauthProfile(readSettings(getProfileFilePath(marked)))) owners.push(marked);
+    }
+    if (owners.length > 0) {
+      for (const owner of owners) {
+        if (expiresAt(live) >= expiresAt(loginFor(owner)?.credential)) {
+          writeSavedLogin(owner, { credential: live, oauthAccount: liveAccount });
+        }
+      }
+    } else {
+      const backup = path.join(getClaudeDir(), ".credentials.json.bak-cpr");
+      fs.writeFileSync(backup, live, { mode: 0o600 });
+      notes.push(`The current login (${accountEmail(liveAccount)}) belongs to no profile; kept a copy in ${backup}.`);
+    }
+  }
+
+  const others = liveHomeSessions();
+  if (others > 0) {
+    notes.push(`${others} other claude session(s) use ~/.claude and switch to this account too.`);
+  }
+
+  if (target) {
+    restoreCredentialForProfile(name);
+    notes.push(`Signed in as ${accountEmail(target.oauthAccount)} (${name}).`);
+  } else {
+    clearLogin();
+    notes.push(`No saved login for ${name}: type /login in claude and sign in with this account.`);
+  }
+  writeActiveProfileMarker(name);
+  return notes;
+}
+
 export function extractApiKey(settings: Settings): string | null {
   const direct = settings.env?.ANTHROPIC_AUTH_TOKEN ?? settings.env?.ANTHROPIC_API_KEY;
   if (direct) return direct;
@@ -413,6 +569,11 @@ export async function runClaude(name: string, claudeArgs: string[], opts: RunOpt
   const oauth = isOauthProfile(settings);
 
   const dir = opts.home ? null : prepareAccountDir(name, { share: opts.share, sessions: opts.sessions });
+  // One shared ~/.claude, one account at a time: swap in this profile's login.
+  // Split launchers only need some claude.ai login for Remote Control.
+  if (!dir && oauth && (!opts.inference || opts.inference === name)) {
+    for (const note of activateHomeLogin(name)) console.error(note);
+  }
   const env = buildClaudeEnv(name, dir);
   if (dir && oauth && !hasLogin(dir)) {
     console.error(`First run of ${name}: type /login in claude and sign in with this account.`);

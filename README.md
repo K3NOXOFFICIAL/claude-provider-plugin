@@ -195,8 +195,8 @@ Requirements and limits:
 Save a start command once, then launch it by name:
 
 ```bash
-cpr launcher add keno anthropic-keno --home                         # your normal ~/.claude login
-cpr launcher add nils anthropic-nils                                # second account, own config dir
+cpr launcher add keno anthropic-keno --home                         # shared ~/.claude, keno's login
+cpr launcher add nils anthropic-nils --home                         # shared ~/.claude, nils's login
 cpr launcher add omni anthropic-keno --home --inference omniroute   # RC on keno, models via gateway
 cpr launcher set keno anthropic-keno --home -- --resume             # change one (args after -- go to claude)
 cpr launcher list
@@ -206,16 +206,24 @@ cpr launcher install-shell                                          # enables `c
 
 Each launcher can be started three ways: `claude <name>` (after `install-shell`), `claude-<name>` (a shim in `~/.local/bin`, or `CPR_BIN_DIR`), or `cpr launch <name> [claude args]`. The interactive menu has a "Start commands" entry for the same.
 
-- `--home` uses the normal `~/.claude` login and data instead of an isolated dir. For a gateway profile, the provider is applied per process through env vars, so `settings.json` is never touched.
+- `--home` runs on the normal `~/.claude` (see below for the login swap) instead of an isolated dir. For a gateway profile, the provider is applied per process through env vars, so `settings.json` is never touched.
 - `install-shell` appends a marked block to your PowerShell profile (or `~/.bashrc` / `~/.zshrc`). It defines a `claude` function that runs a launcher when the first argument is a launcher name, and otherwise calls whatever `claude` was before. A backup is written as `<profile>.bak-cpr`. PowerShell functions drop a literal `--` argument, so call the previous target directly when you need one.
 - A shim is never written over (or deleted from) a file that cpr did not create. If `claude-<name>` already exists, the launcher still works through `claude <name>` and `cpr launch <name>`.
 - Launcher names cannot shadow claude subcommands (`mcp`, `update`, `remote-control`, …).
 - Isolated account dirs start from your MCP servers and project trust only, never your main account's cached flags or Remote Control state. On every start they also pick up folders newly trusted in `~/.claude.json`. Dirs seeded by an older version can be cleaned with `cpr account-clean <profile...>`.
 - The first `claude remote-control` in a new account dir asks "Enable Remote Control? (y/n)" once. It refuses to run from your home directory; start it from a project folder.
 
-### Shared Sessions (switch accounts mid-session)
+### One Shared ~/.claude, Different Accounts
 
-All accounts use the same sessions: transcripts and project memory (`projects`), rewind checkpoints (`file-history`), `plans`, `tasks` and `todos` in every account dir are links to `~/.claude`. When one subscription hits its limit, exit and continue the same conversation on the other:
+Launchers with `--home` all run on the same `~/.claude`: same settings, memory, sessions, jobs and history. Only the claude.ai login differs. Starting a login launcher makes its account the live one: the outgoing login is saved under the profile it belongs to (matched by account, so refreshed tokens are kept), then the incoming one is restored. Split launchers (`--inference`) don't swap; they keep whatever login is live for Remote Control.
+
+```bash
+cpr launcher set keno anthropic-keno --home                         # kenoschreibt@… login
+cpr launcher set nils anthropic-nils --home                         # second account, same everything else
+cpr launcher set omni anthropic-keno --home --inference omniroute   # models via OmniRoute
+```
+
+When one subscription hits its limit, exit and continue the same conversation on the other:
 
 ```bash
 claude keno              # ... "You've hit your session limit"
@@ -223,11 +231,10 @@ claude nils --continue   # same folder: picks up the latest session
 claude nils --resume     # or pick any session
 ```
 
-- Run a session in one account at a time; two processes writing the same session will fork or corrupt it.
+- One account at a time: starting `claude nils` switches every running session on `~/.claude` to nils (cpr warns when others are running). For two accounts at once, use an isolated launcher (without `--home`) for the second one.
 - Thinking is bound to the account's organization. After a switch, Claude Code notes it "can't use thinking from another organization", rereads the session and carries on (one-time extra tokens).
-- Private session dirs from earlier runs are merged into the shared ones on the next start. Nothing is overwritten; leftovers stay in `<dir>.bak-cpr`.
-- Prompt history (up-arrow) stays per account.
-- To keep one account separate: `--own-sessions` on `cpr run` or `cpr launcher add|set`.
+- A profile's first login comes from its isolated account dir if it has one (`/login` there), else from `cpr credential save <profile>`, else claude asks for `/login`.
+- Isolated account dirs share transcripts and memory (`projects`), `file-history`, `plans`, `tasks` and `todos` with `~/.claude` too, so `--resume` works across them; their startup job list and prompt history stay their own. `--own-sessions` keeps an isolated dir fully separate.
 
 ### Custom `/v1` Gateways
 

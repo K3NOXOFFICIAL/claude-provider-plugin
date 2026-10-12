@@ -37,7 +37,7 @@ const ACTIVE_PROFILE_MARKER = ".active-profile";
 /**
  * Read the active profile name recorded in ~/.claude/.active-profile
  */
-function readActiveProfileMarker(): string | null {
+export function readActiveProfileMarker(): string | null {
   try {
     const markerPath = path.join(getClaudeDir(), ACTIVE_PROFILE_MARKER);
     if (!fs.existsSync(markerPath)) return null;
@@ -53,7 +53,7 @@ function readActiveProfileMarker(): string | null {
  * Used as a tiebreaker when multiple profiles share the same base URL
  * (e.g. different Anthropic plans on the same account)
  */
-function writeActiveProfileMarker(name: string): void {
+export function writeActiveProfileMarker(name: string): void {
   try {
     const markerPath = path.join(getClaudeDir(), ACTIVE_PROFILE_MARKER);
     fs.writeFileSync(markerPath, `${name}\n`, { mode: 0o600 });
